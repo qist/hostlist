@@ -4,7 +4,7 @@
 
 `hostlist` 是一个 CoreDNS 插件，使用 [AdGuard HostlistsRegistry](https://github.com/AdguardTeam/HostlistsRegistry) 格式的规则进行 DNS 域名过滤。支持黑名单/白名单两种模式，远程规则自动同步，本地缓存。
 
-插件优先级高于 `speedcheck`，在请求链中先于测速插件执行。
+插件在 `tsig` 之后执行，优先级高于测速、缓存等插件。
 
 ## 特性
 
@@ -192,8 +192,6 @@ git clone https://github.com/qist/hostlist.git plugin/hostlist
 ```
 
 ### 3. 注册插件
-
-编辑 `plugin.cfg`，在 `speedcheck:speedcheck` **之前**添加一行：
 
 ```bash
 grep -q '^hostlist:hostlist' plugin.cfg || sed -i '/^tsig:tsig$/a hostlist:hostlist' plugin.cfg
