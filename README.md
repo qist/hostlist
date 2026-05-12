@@ -181,7 +181,7 @@ hostlist {
 ### 1. 克隆 CoreDNS 源码
 
 ```bash
-git clone https://github.com/coredns/coredns.git
+git clone https://github.com/coredns/coredns.git coredns
 cd coredns
 ```
 
