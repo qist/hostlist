@@ -2,6 +2,7 @@ package hostlist
 
 import (
 	"context"
+	"net"
 	"regexp"
 	"strings"
 	"sync"
@@ -97,11 +98,18 @@ func (h *Hostlist) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *dns.Ms
 	m.SetReply(r)
 	m.Authoritative = true
 
-	if h.blockType == "empty" {
-		m.Rcode = dns.RcodeSuccess
-	} else {
+	switch h.blockType {
+	case "nxdomain":
 		m.Rcode = dns.RcodeNameError
 		m.Ns = []dns.RR{soaFromZone(zone)}
+	case "empty":
+		m.Rcode = dns.RcodeSuccess
+	default: // "0.0.0.0" or any value
+		m.Rcode = dns.RcodeSuccess
+		m.Answer = []dns.RR{&dns.A{
+			Hdr: dns.RR_Header{Name: qname, Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: defaultTTL},
+			A:   net.IPv4zero,
+		}}
 	}
 
 	w.WriteMsg(m)

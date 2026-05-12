@@ -26,7 +26,7 @@ hostlist {
     allowlist <rule>              # 用户白名单规则（可重复）
     blocklist <rule>              # 用户黑名单规则（可重复）
     mode blacklist|whitelist      # 模式，默认 blacklist
-    block_type nxdomain|empty     # 拦截响应类型，默认 nxdomain
+    block_type 0.0.0.0|nxdomain|empty  # 拦截响应类型，默认 0.0.0.0
     refresh <duration>            # 远程同步间隔，默认 4d
     cache_dir <path>              # 缓存目录，默认 ./hostlist/
 }
@@ -148,7 +148,8 @@ hostlist {
 
 ### 拦截响应
 
-- `block_type nxdomain`（默认）：返回 NXDOMAIN + SOA
+- `block_type 0.0.0.0`（默认）：返回 NOERROR + A 记录 `0.0.0.0`
+- `block_type nxdomain`：返回 NXDOMAIN + SOA
 - `block_type empty`：返回 NOERROR，无应答记录
 
 ### 域名匹配
@@ -186,22 +187,19 @@ cd coredns
 
 ### 2. 添加 hostlist 插件
 
-将插件目录复制到 `plugin/hostlist/`：
-
 ```bash
-git clone https://github.com/qist/hostlist.git /tmp/hostlist
-cp -r /tmp/hostlist/plugin/hostlist plugin/hostlist
+git clone https://github.com/qist/hostlist.git plugin/hostlist
 ```
 
 ### 3. 注册插件
 
 编辑 `plugin.cfg`，在 `speedcheck:speedcheck` **之前**添加一行：
 
+```bash
+grep -q '^hostlist:hostlist' plugin.cfg || sed -i '/^tsig:tsig$/a hostlist:hostlist' plugin.cfg
 ```
-tsig:tsig
-hostlist:hostlist
-speedcheck:speedcheck
-```
+
+这会在 `tsig:tsig` 之后插入 `hostlist:hostlist`，如果已存在则跳过。
 
 ### 4. 生成代码并编译
 

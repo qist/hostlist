@@ -15,27 +15,31 @@ func TestParse(t *testing.T) {
 	}{
 		{`hostlist {
 			url https://example.com/filter.txt
-		}`, false, "blacklist", "nxdomain"},
+		}`, false, "blacklist", "0.0.0.0"},
 		{`hostlist {
 			file /etc/coredns/blocklist.txt
-		}`, false, "blacklist", "nxdomain"},
+		}`, false, "blacklist", "0.0.0.0"},
 		{`hostlist {
 			url https://example.com/filter.txt
 			allowlist @@||youtube.com^
 			allowlist @@||google.com^
-		}`, false, "blacklist", "nxdomain"},
+		}`, false, "blacklist", "0.0.0.0"},
 		{`hostlist {
 			url https://example.com/filter.txt
 			mode whitelist
-		}`, false, "whitelist", "nxdomain"},
+		}`, false, "whitelist", "0.0.0.0"},
 		{`hostlist {
 			url https://example.com/filter.txt
 			block_type empty
 		}`, false, "blacklist", "empty"},
 		{`hostlist {
 			url https://example.com/filter.txt
-			refresh 12h
+			block_type nxdomain
 		}`, false, "blacklist", "nxdomain"},
+		{`hostlist {
+			url https://example.com/filter.txt
+			refresh 12h
+		}`, false, "blacklist", "0.0.0.0"},
 		{`hostlist {
 			url https://example.com/filter.txt
 			mode invalid

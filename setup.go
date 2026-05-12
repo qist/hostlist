@@ -49,7 +49,7 @@ func parse(c *caddy.Controller) (*Hostlist, error) {
 	h := &Hostlist{
 		Origins:   plugin.OriginsFromArgsOrServerBlock(nil, c.ServerBlockKeys),
 		mode:      "blacklist",
-		blockType: "nxdomain",
+		blockType: "0.0.0.0",
 		domainTrie: NewTrie(),
 		exactTrie:  NewTrie(),
 		allowTrie:  NewTrie(),
