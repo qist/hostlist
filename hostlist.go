@@ -4,6 +4,8 @@ import (
 	"context"
 	"net"
 	"regexp"
+	"runtime"
+	"runtime/debug"
 	"strings"
 	"sync"
 
@@ -142,6 +144,10 @@ func (h *Hostlist) Update(result ParseResult) {
 	h.blockRegexps = newBlockRe
 	h.allowRegexps = newAllowRe
 	h.mu.Unlock()
+
+	// Force GC to free old tries and return memory to OS (AdGuard Home pattern)
+	runtime.GC()
+	debug.FreeOSMemory()
 
 	total := newDomain.Len() + newExact.Len()
 	DomainsLoaded.Set(float64(total))

@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
@@ -187,6 +188,7 @@ func (l *Loader) fetchURL(url string) ([]byte, error) {
 
 // StartPeriodicRefresh starts a goroutine that periodically reloads rules.
 // Returns a stop channel that should be closed on shutdown.
+// Skips reload if the previous one is still running (prevents memory buildup).
 func (l *Loader) StartPeriodicRefresh(onUpdate func()) chan struct{} {
 	stop := make(chan struct{})
 	if l.interval <= 0 {
@@ -195,10 +197,18 @@ func (l *Loader) StartPeriodicRefresh(onUpdate func()) chan struct{} {
 	go func() {
 		ticker := time.NewTicker(l.interval)
 		defer ticker.Stop()
+		var reloading int32
 		for {
 			select {
 			case <-ticker.C:
-				onUpdate()
+				if !atomic.CompareAndSwapInt32(&reloading, 0, 1) {
+					log.Warningf("Skipping reload: previous refresh still running")
+					continue
+				}
+				go func() {
+					defer atomic.StoreInt32(&reloading, 0)
+					onUpdate()
+				}()
 			case <-stop:
 				return
 			}
