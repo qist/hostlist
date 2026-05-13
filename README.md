@@ -14,6 +14,7 @@
 - 定时自动同步远程规则，支持本地缓存
 - 反向标签 trie 数据结构，50 万+ 域名毫秒级匹配
 - 用户自定义黑白名单，不受远程更新影响
+- 客户端 IP 白名单，指定 IP 绕过家长控制和安全搜索
 
 ## Corefile 语法
 
@@ -29,6 +30,7 @@ hostlist {
     block_type 0.0.0.0|nxdomain|empty  # 拦截响应类型，默认 0.0.0.0
     safesearch on|off             # 安全搜索，默认 off
     parental on|off               # 家长控制，默认 off
+    bypass_ip <ip/cidr>           # 客户端 IP 白名单，绕过家长控制和安全搜索（可重复）
     refresh <duration>            # 远程同步间隔，默认 4d
     cache_dir <path>              # 缓存目录，默认 ./hostlist/
 }
@@ -73,6 +75,11 @@ hostlist {
         # 设置
         mode blacklist
         block_type nxdomain
+        parental off
+        safesearch off
+        bypass_ip 192.168.1.100
+        bypass_ip 10.0.0.0/24
+        bypass_ip 172.16.0.0/16
         refresh 12h
         cache_dir /var/lib/coredns/hostlist
     }
@@ -94,6 +101,23 @@ hostlist {
 ```
 
 白名单模式下，仅放行规则列表中的域名，其他全部拦截。
+
+### 家长控制 + 安全搜索 + IP 白名单
+
+```
+. {
+    hostlist {
+        parental on
+        safesearch on
+        bypass_ip 192.168.1.100
+        bypass_ip 10.0.0.0/24
+        bypass_ip 172.16.0.0/16
+    }
+    forward . 8.8.8.8:53
+}
+```
+
+`bypass_ip` 指定的客户端 IP 不受家长控制拦截和安全搜索重写限制，其他客户端正常过滤。
 
 ## 规则格式
 
@@ -210,8 +234,31 @@ hostlist {
 ```
 
 启用后自动加载：
-- HaGeZi's Gambling Blocklist（赌博网站）
-- The Big List of Hacked Malware Web Sites（恶意软件）
+- 赌博网站
+- 恶意软件
+- NSFW网站
+
+## 客户端 IP 白名单
+
+`bypass_ip` 指定客户端 IP 或 CIDR 网段，这些客户端发起的 DNS 查询将绕过家长控制拦截和安全搜索重写，直接放行。
+
+```
+. {
+    hostlist {
+        parental on
+        safesearch on
+        bypass_ip 192.168.1.100       # 单个 IP
+        bypass_ip 10.0.0.0/24         # CIDR 网段
+        bypass_ip 2001:db8::/32       # IPv6 网段
+    }
+    forward . 8.8.8.8:53
+}
+```
+
+适用场景：
+- 家庭网络中，家长设备不受限制，孩子设备受家长控制和安全搜索保护
+- 企业内部，管理设备绕过过滤，员工设备正常过滤
+- 支持 IPv4 和 IPv6 地址，支持 CIDR 网段格式
 
 ## 缓存目录
 

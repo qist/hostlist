@@ -24,9 +24,9 @@ type Hostlist struct {
 	Next    plugin.Handler
 	Origins []string
 
-	domainTrie   *Trie           // ||domain^ rules (ancestor match)
-	exactTrie    *Trie           // hosts format rules (exact match)
-	allowTrie    *Trie           // @@||domain^ rules (ancestor match)
+	domainTrie   *Trie            // ||domain^ rules (ancestor match)
+	exactTrie    *Trie            // hosts format rules (exact match)
+	allowTrie    *Trie            // @@||domain^ rules (ancestor match)
 	blockRegexps []*regexp.Regexp // /REGEX/ compiled patterns
 	allowRegexps []*regexp.Regexp // @@/REGEX/ compiled patterns
 	mu           sync.RWMutex
@@ -35,6 +35,8 @@ type Hostlist struct {
 	blockType  string      // "0.0.0.0" | "nxdomain" | "empty"
 	safeSearch *SafeSearch // safe search handler
 	loader     *Loader
+
+	bypassIPs []net.IPNet // client IPs that bypass parental control and safe search
 }
 
 func (h *Hostlist) Name() string { return pluginName }
@@ -64,6 +66,12 @@ func (h *Hostlist) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *dns.Ms
 
 	zone := plugin.Zones(h.Origins).Matches(qname)
 	if zone == "" {
+		return plugin.NextOrFailure(h.Name(), h.Next, ctx, w, r)
+	}
+
+	// Check if client IP is in bypass whitelist
+	// Bypass IPs skip both safe search and parental control blocking
+	if h.isBypassIP(state.IP()) {
 		return plugin.NextOrFailure(h.Name(), h.Next, ctx, w, r)
 	}
 
@@ -169,4 +177,18 @@ func (h *Hostlist) Update(result ParseResult) {
 	DomainsLoaded.Set(float64(total))
 	log.Infof("Updated hostlist: %d blocked domains, %d exact, %d allowlist, %d block regexps, %d allow regexps",
 		newDomain.Len(), newExact.Len(), newAllow.Len(), len(newBlockRe), len(newAllowRe))
+}
+
+// isBypassIP checks if the given IP is in the bypass whitelist.
+func (h *Hostlist) isBypassIP(ip string) bool {
+	clientIP := net.ParseIP(ip)
+	if clientIP == nil {
+		return false
+	}
+	for _, cidr := range h.bypassIPs {
+		if cidr.Contains(clientIP) {
+			return true
+		}
+	}
+	return false
 }

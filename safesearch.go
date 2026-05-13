@@ -4,6 +4,7 @@ import (
 	"net"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/miekg/dns"
 )
@@ -300,13 +301,20 @@ var safeSearchMap = map[string]SafeSearchEntry{
 	"kiddle.co": {CNAME: "safe.kiddle.co."},
 }
 
+// cachedIP stores a resolved IP with its expiry time.
+type cachedIP struct {
+	ip      net.IP
+	expires time.Time
+}
+
 // SafeSearch handles safe search DNS rewrites.
 type SafeSearch struct {
 	enabled          bool
 	mu               sync.RWMutex
 	entries          map[string]SafeSearchEntry
-	resolveCache     map[string]net.IP // CNAME target -> resolved A record
-	resolveCacheAAAA map[string]net.IP // CNAME target -> resolved AAAA record
+	resolveCache     map[string]cachedIP // CNAME target -> resolved A record with TTL
+	resolveCacheAAAA map[string]cachedIP // CNAME target -> resolved AAAA record with TTL
+	cacheTTL         time.Duration       // TTL for cached DNS resolutions
 }
 
 // NewSafeSearch creates a new SafeSearch handler.
@@ -318,15 +326,16 @@ func NewSafeSearch(enabled bool) *SafeSearch {
 	return &SafeSearch{
 		enabled:          enabled,
 		entries:          entries,
-		resolveCache:     make(map[string]net.IP),
-		resolveCacheAAAA: make(map[string]net.IP),
+		resolveCache:     make(map[string]cachedIP),
+		resolveCacheAAAA: make(map[string]cachedIP),
+		cacheTTL:         defaultTTL * time.Second,
 	}
 }
 
 // Lookup checks if a domain should be rewritten for safe search.
 // Returns the entry and true if matched.
 // For CNAME-only entries, it resolves the CNAME target to A and AAAA records
-// on demand and caches the results for subsequent lookups.
+// on demand and caches the results with TTL expiry.
 func (s *SafeSearch) Lookup(domain string) (SafeSearchEntry, bool) {
 	if !s.enabled {
 		return SafeSearchEntry{}, false
@@ -342,41 +351,47 @@ func (s *SafeSearch) Lookup(domain string) (SafeSearchEntry, bool) {
 	// If entry has CNAME but no A/AAAA record, resolve the CNAME target on demand
 	if entry.CNAME != "" && entry.A == nil && entry.AAAA == nil {
 		target := strings.TrimSuffix(entry.CNAME, ".")
+		now := time.Now()
 
 		s.mu.RLock()
-		ip, aCached := s.resolveCache[target]
-		ip6, aaaaCached := s.resolveCacheAAAA[target]
+		aCached, aOk := s.resolveCache[target]
+		aaaaCached, aaaaOk := s.resolveCacheAAAA[target]
 		s.mu.RUnlock()
 
-		if !aCached || !aaaaCached {
+		// Check if cached entries are still valid
+		aValid := aOk && now.Before(aCached.expires)
+		aaaaValid := aaaaOk && now.Before(aaaaCached.expires)
+
+		if !aValid || !aaaaValid {
 			ips, err := net.LookupHost(target)
 			if err == nil {
+				expires := now.Add(s.cacheTTL)
 				for _, raw := range ips {
 					parsed := net.ParseIP(raw)
 					if parsed == nil {
 						continue
 					}
-					if parsed.To4() != nil && !aCached {
+					if parsed.To4() != nil && !aValid {
 						s.mu.Lock()
-						s.resolveCache[target] = parsed
+						s.resolveCache[target] = cachedIP{ip: parsed, expires: expires}
 						s.mu.Unlock()
-						ip = parsed
-						aCached = true
-					} else if parsed.To16() != nil && parsed.To4() == nil && !aaaaCached {
+						aCached = cachedIP{ip: parsed, expires: expires}
+						aValid = true
+					} else if parsed.To16() != nil && parsed.To4() == nil && !aaaaValid {
 						s.mu.Lock()
-						s.resolveCacheAAAA[target] = parsed
+						s.resolveCacheAAAA[target] = cachedIP{ip: parsed, expires: expires}
 						s.mu.Unlock()
-						ip6 = parsed
-						aaaaCached = true
+						aaaaCached = cachedIP{ip: parsed, expires: expires}
+						aaaaValid = true
 					}
 				}
 			}
 		}
-		if ip != nil {
-			entry.A = ip
+		if aValid {
+			entry.A = aCached.ip
 		}
-		if ip6 != nil {
-			entry.AAAA = ip6
+		if aaaaValid {
+			entry.AAAA = aaaaCached.ip
 		}
 	}
 
@@ -384,9 +399,14 @@ func (s *SafeSearch) Lookup(domain string) (SafeSearchEntry, bool) {
 }
 
 // SetEnabled enables or disables safe search.
+// When disabling, clears the DNS resolution cache to free memory.
 func (s *SafeSearch) SetEnabled(enabled bool) {
 	s.mu.Lock()
 	s.enabled = enabled
+	if !enabled {
+		s.resolveCache = make(map[string]cachedIP)
+		s.resolveCacheAAAA = make(map[string]cachedIP)
+	}
 	s.mu.Unlock()
 }
 

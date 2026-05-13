@@ -1,6 +1,7 @@
 package hostlist
 
 import (
+	"net"
 	"path/filepath"
 	"time"
 
@@ -203,6 +204,27 @@ func parse(c *caddy.Controller) (*Hostlist, error) {
 					// do nothing
 				default:
 					return nil, c.Errf("invalid parental value %q, must be 'on' or 'off'", c.Val())
+				}
+
+			case "bypass_ip":
+				if !c.NextArg() {
+					return nil, c.ArgErr()
+				}
+				for _, arg := range append([]string{c.Val()}, c.RemainingArgs()...) {
+					_, cidr, err := net.ParseCIDR(arg)
+					if err != nil {
+						// Try as plain IP (convert to /32 or /128)
+						ip := net.ParseIP(arg)
+						if ip == nil {
+							return nil, c.Errf("invalid IP or CIDR %q", arg)
+						}
+						if ip.To4() != nil {
+							_, cidr, _ = net.ParseCIDR(ip.String() + "/32")
+						} else {
+							_, cidr, _ = net.ParseCIDR(ip.String() + "/128")
+						}
+					}
+					h.bypassIPs = append(h.bypassIPs, *cidr)
 				}
 
 			default:
