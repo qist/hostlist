@@ -146,10 +146,10 @@ func parse(c *caddy.Controller) (*Hostlist, error) {
 					return nil, c.ArgErr()
 				}
 				switch c.Val() {
-				case "nxdomain", "empty":
+				case "nxdomain", "empty", "0.0.0.0":
 					h.blockType = c.Val()
 				default:
-					return nil, c.Errf("invalid block_type %q, must be 'nxdomain' or 'empty'", c.Val())
+					return nil, c.Errf("invalid block_type %q, must be '0.0.0.0', 'nxdomain' or 'empty'", c.Val())
 				}
 
 			case "cache_dir":
