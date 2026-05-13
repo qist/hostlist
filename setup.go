@@ -22,15 +22,7 @@ func setup(c *caddy.Controller) error {
 	}
 
 	c.OnStartup(func() error {
-		// Phase 1: Load from cache immediately (no network, instant startup)
-		cachedResult := h.loader.LoadFromCache()
-		if cachedResult.Blocked != nil || cachedResult.BlockedExact != nil || cachedResult.Allowlist != nil {
-			h.Update(cachedResult)
-			log.Infof("Loaded %d domains from cache, starting async refresh",
-				len(cachedResult.Blocked)+len(cachedResult.BlockedExact))
-		}
-
-		// Phase 2: Async refresh in background (download latest rules)
+		// Start async refresh immediately (no cache trie to avoid double memory)
 		go func() {
 			result := h.loader.LoadAll()
 			h.Update(result)
