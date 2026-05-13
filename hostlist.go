@@ -144,6 +144,11 @@ func (h *Hostlist) Update(result ParseResult) {
 		newAllow.Insert(d)
 	}
 
+	// Compact tries: merge single-child non-terminal nodes to reduce memory
+	newDomain.Compact()
+	newExact.Compact()
+	newAllow.Compact()
+
 	newBlockRe := CompileRegexps(result.RegexBlock)
 	newAllowRe := CompileRegexps(result.RegexAllow)
 
