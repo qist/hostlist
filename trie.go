@@ -44,10 +44,13 @@ func (in *Interner) Intern(s string) string {
 // package-level string interners shared across all tries for maximum deduplication
 var labelInterner = NewInterner()
 
+const trieChildIndexThreshold = 8
+
 type trieNode struct {
-	children []trieChild // nil until first child added; slices are smaller than maps for typical DNS fanout
-	blocked  bool        // set by Insert: blocks this node AND all descendants
-	exact    bool        // set by InsertExact: blocks ONLY this exact domain
+	children   []trieChild          // nil until first child added; compact for low fanout nodes
+	childIndex map[string]*trieNode // built only for high fanout nodes to keep loads fast
+	blocked    bool                 // set by Insert: blocks this node AND all descendants
+	exact      bool                 // set by InsertExact: blocks ONLY this exact domain
 }
 
 type trieChild struct {
@@ -60,7 +63,7 @@ type trieChild struct {
 //
 // Memory optimizations:
 //   - String interning: identical label strings share memory via Interner
-//   - Compact child slices: leaf nodes have nil children (no wasted memory)
+//   - Compact child slices for low fanout nodes, indexed lookup for high fanout nodes
 type Trie struct {
 	root   *trieNode
 	length int
@@ -89,6 +92,15 @@ func labels(domain string) []string {
 // The label is interned for memory deduplication.
 func (t *Trie) getOrCreateChild(node *trieNode, label string) *trieNode {
 	interned := labelInterner.Intern(label)
+	if node.childIndex != nil {
+		if child, ok := node.childIndex[interned]; ok {
+			return child
+		}
+		child := &trieNode{}
+		node.children = append(node.children, trieChild{label: interned, node: child})
+		node.childIndex[interned] = child
+		return child
+	}
 	for i := range node.children {
 		if node.children[i].label == interned {
 			return node.children[i].node
@@ -96,6 +108,12 @@ func (t *Trie) getOrCreateChild(node *trieNode, label string) *trieNode {
 	}
 	child := &trieNode{}
 	node.children = append(node.children, trieChild{label: interned, node: child})
+	if len(node.children) > trieChildIndexThreshold {
+		node.childIndex = make(map[string]*trieNode, len(node.children))
+		for i := range node.children {
+			node.childIndex[node.children[i].label] = node.children[i].node
+		}
+	}
 	return child
 }
 
@@ -168,6 +186,9 @@ func (t *Trie) Lookup(domain string) bool {
 }
 
 func (n *trieNode) child(label string) *trieNode {
+	if n.childIndex != nil {
+		return n.childIndex[label]
+	}
 	for i := range n.children {
 		if n.children[i].label == label {
 			return n.children[i].node
