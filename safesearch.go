@@ -10,8 +10,9 @@ import (
 
 // SafeSearchEntry defines a safe search rewrite rule.
 type SafeSearchEntry struct {
-	CNAME string // CNAME target (empty if using A record)
-	A     net.IP // A record (used if CNAME is empty)
+	CNAME string // CNAME target (empty if using A/AAAA record)
+	A     net.IP // A record (IPv4)
+	AAAA  net.IP // AAAA record (IPv6)
 }
 
 // safeSearchMap is the built-in safe search domain mapping.
@@ -301,9 +302,11 @@ var safeSearchMap = map[string]SafeSearchEntry{
 
 // SafeSearch handles safe search DNS rewrites.
 type SafeSearch struct {
-	enabled bool
-	mu      sync.RWMutex
-	entries map[string]SafeSearchEntry
+	enabled          bool
+	mu               sync.RWMutex
+	entries          map[string]SafeSearchEntry
+	resolveCache     map[string]net.IP // CNAME target -> resolved A record
+	resolveCacheAAAA map[string]net.IP // CNAME target -> resolved AAAA record
 }
 
 // NewSafeSearch creates a new SafeSearch handler.
@@ -312,11 +315,18 @@ func NewSafeSearch(enabled bool) *SafeSearch {
 	for k, v := range safeSearchMap {
 		entries[k] = v
 	}
-	return &SafeSearch{enabled: enabled, entries: entries}
+	return &SafeSearch{
+		enabled:          enabled,
+		entries:          entries,
+		resolveCache:     make(map[string]net.IP),
+		resolveCacheAAAA: make(map[string]net.IP),
+	}
 }
 
 // Lookup checks if a domain should be rewritten for safe search.
 // Returns the entry and true if matched.
+// For CNAME-only entries, it resolves the CNAME target to A and AAAA records
+// on demand and caches the results for subsequent lookups.
 func (s *SafeSearch) Lookup(domain string) (SafeSearchEntry, bool) {
 	if !s.enabled {
 		return SafeSearchEntry{}, false
@@ -325,7 +335,52 @@ func (s *SafeSearch) Lookup(domain string) (SafeSearchEntry, bool) {
 	s.mu.RLock()
 	entry, ok := s.entries[name]
 	s.mu.RUnlock()
-	return entry, ok
+	if !ok {
+		return SafeSearchEntry{}, false
+	}
+
+	// If entry has CNAME but no A/AAAA record, resolve the CNAME target on demand
+	if entry.CNAME != "" && entry.A == nil && entry.AAAA == nil {
+		target := strings.TrimSuffix(entry.CNAME, ".")
+
+		s.mu.RLock()
+		ip, aCached := s.resolveCache[target]
+		ip6, aaaaCached := s.resolveCacheAAAA[target]
+		s.mu.RUnlock()
+
+		if !aCached || !aaaaCached {
+			ips, err := net.LookupHost(target)
+			if err == nil {
+				for _, raw := range ips {
+					parsed := net.ParseIP(raw)
+					if parsed == nil {
+						continue
+					}
+					if parsed.To4() != nil && !aCached {
+						s.mu.Lock()
+						s.resolveCache[target] = parsed
+						s.mu.Unlock()
+						ip = parsed
+						aCached = true
+					} else if parsed.To16() != nil && parsed.To4() == nil && !aaaaCached {
+						s.mu.Lock()
+						s.resolveCacheAAAA[target] = parsed
+						s.mu.Unlock()
+						ip6 = parsed
+						aaaaCached = true
+					}
+				}
+			}
+		}
+		if ip != nil {
+			entry.A = ip
+		}
+		if ip6 != nil {
+			entry.AAAA = ip6
+		}
+	}
+
+	return entry, true
 }
 
 // SetEnabled enables or disables safe search.
@@ -343,6 +398,7 @@ func (s *SafeSearch) Enabled() bool {
 }
 
 // buildSafeSearchResponse builds a DNS response for a safe search rewrite.
+// Prefers A/AAAA records (resolved from CNAME targets) over CNAME responses.
 func buildSafeSearchResponse(r *dns.Msg, qname string, entry SafeSearchEntry) *dns.Msg {
 	m := new(dns.Msg)
 	m.SetReply(r)
@@ -351,19 +407,24 @@ func buildSafeSearchResponse(r *dns.Msg, qname string, entry SafeSearchEntry) *d
 
 	qtype := r.Question[0].Qtype
 
-	if entry.CNAME != "" {
-		// Return only CNAME record, let client resolve the target IP
-		// This is the correct approach as different search engines have different IPs
+	if entry.A != nil && (qtype == dns.TypeA || qtype == dns.TypeANY) {
+		m.Answer = append(m.Answer, &dns.A{
+			Hdr: dns.RR_Header{Name: qname, Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: defaultTTL},
+			A:   entry.A,
+		})
+	}
+	if entry.AAAA != nil && (qtype == dns.TypeAAAA || qtype == dns.TypeANY) {
+		m.Answer = append(m.Answer, &dns.AAAA{
+			Hdr:  dns.RR_Header{Name: qname, Rrtype: dns.TypeAAAA, Class: dns.ClassINET, Ttl: defaultTTL},
+			AAAA: entry.AAAA,
+		})
+	}
+	if len(m.Answer) == 0 && entry.CNAME != "" {
 		cname := &dns.CNAME{
 			Hdr:    dns.RR_Header{Name: qname, Rrtype: dns.TypeCNAME, Class: dns.ClassINET, Ttl: defaultTTL},
 			Target: entry.CNAME,
 		}
 		m.Answer = append(m.Answer, cname)
-	} else if entry.A != nil && (qtype == dns.TypeA || qtype == dns.TypeANY) {
-		m.Answer = append(m.Answer, &dns.A{
-			Hdr: dns.RR_Header{Name: qname, Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: defaultTTL},
-			A:   entry.A,
-		})
 	}
 
 	return m
