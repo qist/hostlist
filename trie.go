@@ -1,7 +1,6 @@
 package hostlist
 
 import (
-	"sort"
 	"strings"
 	"sync"
 
@@ -9,6 +8,7 @@ import (
 )
 
 // Interner deduplicates strings to reduce memory usage.
+// Safe for concurrent use.
 type Interner struct {
 	mu   sync.RWMutex
 	pool map[string]string
@@ -18,6 +18,9 @@ func NewInterner() *Interner {
 	return &Interner{pool: make(map[string]string)}
 }
 
+// Intern returns a canonical copy of s, reusing previously interned strings.
+// This ensures identical label strings (e.g., "com", "org") share the same
+// memory across the entire trie structure.
 func (in *Interner) Intern(s string) string {
 	if s == "" {
 		return s
@@ -38,26 +41,21 @@ func (in *Interner) Intern(s string) string {
 	return s
 }
 
+// package-level string interners shared across all tries for maximum deduplication
 var labelInterner = NewInterner()
 
-type childEntry struct {
-	label string
-	node  *trieNode
-}
-
 type trieNode struct {
-	children []childEntry // sorted by label; nil for leaf nodes
-	blocked  bool
-	exact    bool
+	children map[string]*trieNode // nil until first child added (saves memory for leaf nodes)
+	blocked  bool                 // set by Insert: blocks this node AND all descendants
+	exact    bool                 // set by InsertExact: blocks ONLY this exact domain
 }
 
-// Trie is a reversed-label compact trie for DNS domain matching.
-// "sub.example.com." is stored as root -> "com" -> "example" -> "sub".
+// Trie is a reversed-label trie for efficient DNS domain matching.
+// For "sub.example.com.", the walk is com -> example -> sub.
 //
 // Memory optimizations:
-//   - Sorted children slice instead of map (no hash table overhead)
-//   - Compact trie: single-child non-terminal nodes are merged into parent's label
-//   - String interning: identical labels share memory via Interner
+//   - String interning: identical label strings share memory via Interner
+//   - Lazy map allocation: leaf nodes have nil children map (no wasted memory)
 type Trie struct {
 	root   *trieNode
 	length int
@@ -67,7 +65,8 @@ func NewTrie() *Trie {
 	return &Trie{root: &trieNode{}}
 }
 
-// labels returns reversed, lowercased labels of a normalized FQDN.
+// labels returns the reversed, lowercased labels of a normalized FQDN.
+// "sub.example.com." -> ["com", "example", "sub"]
 func labels(domain string) []string {
 	fqdn := strings.ToLower(dns.Fqdn(domain))
 	fqdn = strings.TrimSuffix(fqdn, ".")
@@ -81,33 +80,25 @@ func labels(domain string) []string {
 	return parts
 }
 
-// findChild returns the index of the child matching label, or the insertion point.
-func (n *trieNode) findChild(label string) (int, bool) {
-	i := sort.Search(len(n.children), func(j int) bool {
-		return n.children[j].label >= label
-	})
-	if i < len(n.children) && n.children[i].label == label {
-		return i, true
-	}
-	return i, false
-}
-
-// getOrCreateChild finds or creates a child node for the given label.
+// getOrCreateChild returns the child node for label, creating it if needed.
 // The label is interned for memory deduplication.
 func (t *Trie) getOrCreateChild(node *trieNode, label string) *trieNode {
-	interned := labelInterner.Intern(label)
-	i, found := node.findChild(interned)
-	if found {
-		return node.children[i].node
+	if node.children == nil {
+		node.children = make(map[string]*trieNode)
 	}
-	child := &trieNode{}
-	node.children = append(node.children, childEntry{})
-	copy(node.children[i+1:], node.children[i:])
-	node.children[i] = childEntry{label: interned, node: child}
+	interned := labelInterner.Intern(label)
+	child, ok := node.children[interned]
+	if !ok {
+		child = &trieNode{}
+		node.children[interned] = child
+	}
 	return child
 }
 
 // Insert adds a domain with ancestor matching.
+// Blocking "example.com." also blocks "foo.bar.example.com."
+// because the "example" node is marked blocked, and Lookup
+// checks blocked at every ancestor.
 func (t *Trie) Insert(domain string) {
 	parts := labels(domain)
 	if len(parts) == 0 {
@@ -124,6 +115,8 @@ func (t *Trie) Insert(domain string) {
 }
 
 // InsertExact adds a domain with exact-only matching.
+// Blocking "360in.com." does NOT block "test.360in.com."
+// even if other subdomains like "ad.360in.com" exist.
 func (t *Trie) InsertExact(domain string) {
 	parts := labels(domain)
 	if len(parts) == 0 {
@@ -142,80 +135,32 @@ func (t *Trie) InsertExact(domain string) {
 // Lookup checks if a domain is matched.
 //
 // For "blocked" (Insert) ancestors: if ANY ancestor node has blocked=true,
-// the domain is blocked (wildcard-style blocking).
+// the domain is blocked. This implements wildcard-style blocking:
+// "||example.com^" blocks all subdomains.
 //
 // For "exact" (InsertExact): only the terminal node's exact flag is checked.
+// Intermediate ancestors with exact=true are NOT matched.
 func (t *Trie) Lookup(domain string) bool {
 	parts := labels(domain)
 	if len(parts) == 0 {
 		return false
 	}
 	node := t.root
-	remaining := parts
-	for len(remaining) > 0 {
+	for _, label := range parts {
 		if node.blocked {
-			return true
+			return true // ancestor match (Insert wildcard)
 		}
-		if len(node.children) == 0 {
+		if node.children == nil {
 			return false
 		}
-		label := remaining[0]
-		i := sort.Search(len(node.children), func(j int) bool {
-			return node.children[j].label >= label
-		})
-		if i >= len(node.children) {
+		child, ok := node.children[label]
+		if !ok {
 			return false
 		}
-		childLabel := node.children[i].label
-		if childLabel == label {
-			node = node.children[i].node
-			remaining = remaining[1:]
-		} else if len(childLabel) > len(label) && childLabel[len(label)] == '.' && childLabel[:len(label)] == label {
-			suffix := childLabel[len(label)+1:]
-			suffixLabels := strings.Split(suffix, ".")
-			if len(suffixLabels) <= len(remaining)-1 {
-				match := true
-				for j, sl := range suffixLabels {
-					if sl != remaining[j+1] {
-						match = false
-						break
-					}
-				}
-				if match {
-					node = node.children[i].node
-					remaining = remaining[len(suffixLabels)+1:]
-					continue
-				}
-			}
-			return false
-		} else {
-			return false
-		}
+		node = child
 	}
+	// Terminal node: check both blocked and exact
 	return node.blocked || node.exact
-}
-
-// Compact merges single-child non-terminal nodes to reduce memory.
-// After compaction, "com" -> "example" -> "sub" becomes "com.example.sub"
-// if "example" is not a terminal node and has only one child.
-func (t *Trie) Compact() {
-	t.compact(t.root)
-}
-
-func (t *Trie) compact(node *trieNode) {
-	for i := 0; i < len(node.children); i++ {
-		child := node.children[i].node
-		t.compact(child)
-		for len(child.children) == 1 && !child.blocked && !child.exact {
-			grandchild := child.children[0]
-			merged := node.children[i].label + "." + grandchild.label
-			node.children[i] = childEntry{
-				label: labelInterner.Intern(merged),
-				node:  grandchild.node,
-			}
-			child = grandchild.node
-		}
-	}
 }
 
 // Len returns the number of entries in the trie.
