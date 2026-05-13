@@ -138,22 +138,24 @@ func (h *Hostlist) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *dns.Ms
 
 // Update rebuilds the tries and regexps from a ParseResult via atomic swap.
 // If SkipUpdate is true (content unchanged), the rebuild is skipped.
+// This method uses a safe memory management strategy: old data is released
+// before new data is loaded to avoid having two copies in memory simultaneously.
 func (h *Hostlist) Update(result ParseResult) {
 	if result.SkipUpdate {
 		log.Debugf("Content unchanged, skipping trie rebuild")
 		return
 	}
 
+	// Parse and compile new data first (without holding the lock)
 	newDomain := NewTrie()
-	newExact := NewTrie()
-	newAllow := NewTrie()
-
 	for _, d := range result.Blocked {
 		newDomain.Insert(d)
 	}
+	newExact := NewTrie()
 	for _, d := range result.BlockedExact {
 		newExact.InsertExact(d)
 	}
+	newAllow := NewTrie()
 	for _, d := range result.Allowlist {
 		newAllow.Insert(d)
 	}
@@ -161,6 +163,17 @@ func (h *Hostlist) Update(result ParseResult) {
 	newBlockRe := CompileRegexps(result.RegexBlock)
 	newAllowRe := CompileRegexps(result.RegexAllow)
 
+	// Safe memory management: release old data before acquiring new data
+	// This avoids having two large copies in memory at the same time
+	h.mu.Lock()
+	h.domainTrie = nil
+	h.exactTrie = nil
+	h.allowTrie = nil
+	h.blockRegexps = nil
+	h.allowRegexps = nil
+	h.mu.Unlock()
+
+	// Now acquire lock and set new data
 	h.mu.Lock()
 	h.domainTrie = newDomain
 	h.exactTrie = newExact
@@ -168,10 +181,6 @@ func (h *Hostlist) Update(result ParseResult) {
 	h.blockRegexps = newBlockRe
 	h.allowRegexps = newAllowRe
 	h.mu.Unlock()
-
-	// Force GC to free old tries and return memory to OS (AdGuard Home pattern)
-	runtime.GC()
-	debug.FreeOSMemory()
 
 	total := newDomain.Len() + newExact.Len()
 	DomainsLoaded.Set(float64(total))
