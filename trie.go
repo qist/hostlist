@@ -2,25 +2,67 @@ package hostlist
 
 import (
 	"strings"
+	"sync"
 
 	"github.com/miekg/dns"
 )
 
+// Interner deduplicates strings to reduce memory usage.
+// Safe for concurrent use.
+type Interner struct {
+	mu   sync.RWMutex
+	pool map[string]string
+}
+
+func NewInterner() *Interner {
+	return &Interner{pool: make(map[string]string)}
+}
+
+// Intern returns a canonical copy of s, reusing previously interned strings.
+// This ensures identical label strings (e.g., "com", "org") share the same
+// memory across the entire trie structure.
+func (in *Interner) Intern(s string) string {
+	if s == "" {
+		return s
+	}
+	in.mu.RLock()
+	if cached, ok := in.pool[s]; ok {
+		in.mu.RUnlock()
+		return cached
+	}
+	in.mu.RUnlock()
+	in.mu.Lock()
+	if cached, ok := in.pool[s]; ok {
+		in.mu.Unlock()
+		return cached
+	}
+	in.pool[s] = s
+	in.mu.Unlock()
+	return s
+}
+
+// package-level string interners shared across all tries for maximum deduplication
+var labelInterner = NewInterner()
+
 type trieNode struct {
-	children map[string]*trieNode
-	blocked  bool // set by Insert: blocks this node AND all descendants
-	exact    bool // set by InsertExact: blocks ONLY this exact domain
+	children map[string]*trieNode // nil until first child added (saves memory for leaf nodes)
+	blocked  bool                 // set by Insert: blocks this node AND all descendants
+	exact    bool                 // set by InsertExact: blocks ONLY this exact domain
 }
 
 // Trie is a reversed-label trie for efficient DNS domain matching.
 // For "sub.example.com.", the walk is com -> example -> sub.
+//
+// Memory optimizations:
+//   - String interning: identical label strings share memory via Interner
+//   - Lazy map allocation: leaf nodes have nil children map (no wasted memory)
 type Trie struct {
 	root   *trieNode
 	length int
 }
 
 func NewTrie() *Trie {
-	return &Trie{root: &trieNode{children: make(map[string]*trieNode)}}
+	return &Trie{root: &trieNode{}}
 }
 
 // labels returns the reversed, lowercased labels of a normalized FQDN.
@@ -38,6 +80,21 @@ func labels(domain string) []string {
 	return parts
 }
 
+// getOrCreateChild returns the child node for label, creating it if needed.
+// The label is interned for memory deduplication.
+func (t *Trie) getOrCreateChild(node *trieNode, label string) *trieNode {
+	if node.children == nil {
+		node.children = make(map[string]*trieNode)
+	}
+	interned := labelInterner.Intern(label)
+	child, ok := node.children[interned]
+	if !ok {
+		child = &trieNode{}
+		node.children[interned] = child
+	}
+	return child
+}
+
 // Insert adds a domain with ancestor matching.
 // Blocking "example.com." also blocks "foo.bar.example.com."
 // because the "example" node is marked blocked, and Lookup
@@ -49,12 +106,7 @@ func (t *Trie) Insert(domain string) {
 	}
 	node := t.root
 	for _, label := range parts {
-		child, ok := node.children[label]
-		if !ok {
-			child = &trieNode{children: make(map[string]*trieNode)}
-			node.children[label] = child
-		}
-		node = child
+		node = t.getOrCreateChild(node, label)
 	}
 	if !node.blocked {
 		node.blocked = true
@@ -72,12 +124,7 @@ func (t *Trie) InsertExact(domain string) {
 	}
 	node := t.root
 	for _, label := range parts {
-		child, ok := node.children[label]
-		if !ok {
-			child = &trieNode{children: make(map[string]*trieNode)}
-			node.children[label] = child
-		}
-		node = child
+		node = t.getOrCreateChild(node, label)
 	}
 	if !node.exact {
 		node.exact = true
@@ -103,6 +150,9 @@ func (t *Trie) Lookup(domain string) bool {
 		if node.blocked {
 			return true // ancestor match (Insert wildcard)
 		}
+		if node.children == nil {
+			return false
+		}
 		child, ok := node.children[label]
 		if !ok {
 			return false
@@ -120,6 +170,6 @@ func (t *Trie) Len() int {
 
 // Clear resets the trie.
 func (t *Trie) Clear() {
-	t.root = &trieNode{children: make(map[string]*trieNode)}
+	t.root = &trieNode{}
 	t.length = 0
 }
