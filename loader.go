@@ -2,6 +2,7 @@ package hostlist
 
 import (
 	"crypto/sha256"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -16,6 +17,13 @@ import (
 type FilterSource struct {
 	URL  string
 	File string
+}
+
+// cacheMeta stores metadata for a cached URL, used for conditional downloads
+// and content change detection.
+type cacheMeta struct {
+	ContentModified string `json:"content_modified,omitempty"` // raw "! Last modified:" from file content
+	ContentVersion  string `json:"content_version,omitempty"`  // raw "! Version:" from file content
 }
 
 // Loader manages loading rules from multiple sources and periodic refresh.
@@ -59,6 +67,11 @@ func (l *Loader) cachePath(url string) string {
 	return filepath.Join(l.cacheDir, fmt.Sprintf("%x.txt", h[:8]))
 }
 
+// metaPath returns the metadata file path for a given cache file.
+func (l *Loader) metaPath(cachePath string) string {
+	return cachePath + ".meta"
+}
+
 // saveCache saves content to a cache file. Errors are silently ignored.
 func (l *Loader) saveCache(path string, data []byte) {
 	if path == "" {
@@ -81,16 +94,97 @@ func (l *Loader) loadCache(path string) []byte {
 	return data
 }
 
+// saveMeta saves cache metadata to a file.
+func (l *Loader) saveMeta(cachePath string, meta cacheMeta) {
+	path := l.metaPath(cachePath)
+	if path == "" {
+		return
+	}
+	data, err := json.Marshal(meta)
+	if err != nil {
+		log.Warningf("Failed to marshal meta for %s: %v", cachePath, err)
+		return
+	}
+	if err := os.WriteFile(path, data, 0644); err != nil {
+		log.Warningf("Failed to save meta %s: %v", path, err)
+	}
+}
+
+// loadMeta reads cache metadata from a file. Returns empty meta if not found.
+func (l *Loader) loadMeta(cachePath string) cacheMeta {
+	path := l.metaPath(cachePath)
+	if path == "" {
+		return cacheMeta{}
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return cacheMeta{}
+	}
+	var meta cacheMeta
+	if err := json.Unmarshal(data, &meta); err != nil {
+		return cacheMeta{}
+	}
+	return meta
+}
+
+// parseLastModifiedFromContent extracts a timestamp from AdGuard filter list
+// content for use as If-Modified-Since. Returns empty string if not found.
+//
+// Supported formats in file content:
+//
+//	! Last modified: 2026-04-17T10:06:25.395Z       (ISO 8601)
+//	! Last modified: 12 May 2026 21:31 UTC           (day month year HH:MM TZ)
+//	! Last modified: 12 May 2026 21:31:40 UTC         (day month year HH:MM:SS TZ)
+//	! Version: 2026.0512.2131.40                      (version-based)
+//
+// The returned value is in HTTP RFC 1123 format for use with If-Modified-Since.
+func parseLastModifiedFromContent(content string) string {
+	var rawDate string
+	for _, line := range strings.Split(content, "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "! Last modified:") {
+			rawDate = strings.TrimSpace(line[len("! Last modified:"):])
+			break
+		}
+	}
+	if rawDate == "" {
+		return ""
+	}
+
+	// Try multiple date formats
+	var t time.Time
+	formats := []string{
+		time.RFC1123,                  // "Tue, 12 May 2026 21:31:00 GMT"
+		"2006-01-02T15:04:05.999Z",    // "2026-04-17T10:06:25.395Z"
+		"2006-01-02T15:04:05Z",        // "2026-04-17T10:06:25Z"
+		"2 January 2006 15:04 MST",    // "12 May 2026 21:31 UTC"
+		"2 January 2006 15:04:05 MST", // "12 May 2026 21:31:40 UTC"
+		"2 Jan 2006 15:04 MST",        // "12 May 2026 21:31 UTC" (short month)
+		"2 Jan 2006 15:04:05 MST",     // "12 May 2026 21:31:40 UTC" (short month)
+		"2006-01-02 15:04:05",         // "2026-04-17 10:06:25"
+		"2006-01-02",                  // "2026-04-17"
+	}
+	for _, f := range formats {
+		var err error
+		t, err = time.Parse(f, rawDate)
+		if err == nil {
+			return t.Format(time.RFC1123)
+		}
+	}
+
+	return ""
+}
+
 // LoadAll loads rules from all sources and user rules, merging results.
-// For URL sources: try remote download first, fall back to local cache.
+// For URL sources: try remote download first with conditional request,
+// fall back to local cache on failure or 304 Not Modified.
 // For file sources: read directly from disk.
 // For allowlist sources: all rules (including ||domain^) are treated as allowlist entries.
-// All errors are gracefully handled - never panics or crashes.
 func (l *Loader) LoadAll() ParseResult {
 	l.ensureCacheDir()
 	var merged ParseResult
+	merged.SkipUpdate = true
 
-	// Load blacklist sources
 	for _, src := range l.sources {
 		result, err := l.loadSource(src)
 		if err != nil {
@@ -100,21 +194,18 @@ func (l *Loader) LoadAll() ParseResult {
 		mergeResult(&merged, result)
 	}
 
-	// Load whitelist sources — all rules go to allowlist
 	for _, src := range l.allowSources {
 		result, err := l.loadSource(src)
 		if err != nil {
 			log.Warningf("Failed to load allowlist from %s: %v", sourceName(src), err)
 			continue
 		}
-		// Force all rules into allowlist regardless of @@ prefix
 		merged.Allowlist = append(merged.Allowlist, result.Blocked...)
 		merged.Allowlist = append(merged.Allowlist, result.Allowlist...)
 		merged.RegexAllow = append(merged.RegexAllow, result.RegexBlock...)
 		merged.RegexAllow = append(merged.RegexAllow, result.RegexAllow...)
 	}
 
-	// Parse user rules
 	if len(l.userRules) > 0 {
 		userResult := ParseRules(multiLineReader(l.userRules))
 		mergeResult(&merged, userResult)
@@ -123,7 +214,44 @@ func (l *Loader) LoadAll() ParseResult {
 	return merged
 }
 
-// loadSource loads rules from a single source. For URLs, tries remote then cache.
+// LoadFromCache loads rules from local cache only (no network requests).
+// Used for fast startup before background refresh completes.
+func (l *Loader) LoadFromCache() ParseResult {
+	l.ensureCacheDir()
+	var merged ParseResult
+	merged.SkipUpdate = true
+
+	for _, src := range l.sources {
+		result, err := l.loadFromCacheOnly(src)
+		if err != nil {
+			log.Debugf("No cached rules for %s: %v", sourceName(src), err)
+			continue
+		}
+		mergeResult(&merged, result)
+	}
+
+	for _, src := range l.allowSources {
+		result, err := l.loadFromCacheOnly(src)
+		if err != nil {
+			log.Debugf("No cached allowlist for %s: %v", sourceName(src), err)
+			continue
+		}
+		merged.Allowlist = append(merged.Allowlist, result.Blocked...)
+		merged.Allowlist = append(merged.Allowlist, result.Allowlist...)
+		merged.RegexAllow = append(merged.RegexAllow, result.RegexBlock...)
+		merged.RegexAllow = append(merged.RegexAllow, result.RegexAllow...)
+	}
+
+	if len(l.userRules) > 0 {
+		userResult := ParseRules(multiLineReader(l.userRules))
+		mergeResult(&merged, userResult)
+	}
+
+	return merged
+}
+
+// loadSource loads rules from a single source. For URLs, tries remote with
+// conditional request, then falls back to cache.
 func (l *Loader) loadSource(src FilterSource) (ParseResult, error) {
 	if src.URL != "" {
 		return l.loadFromURL(src.URL)
@@ -134,29 +262,105 @@ func (l *Loader) loadSource(src FilterSource) (ParseResult, error) {
 	return ParseResult{}, fmt.Errorf("source has neither url nor file")
 }
 
-// loadFromURL downloads rules from a URL. On failure, falls back to local cache.
+// loadFromCacheOnly loads rules from local cache only (no network).
+func (l *Loader) loadFromCacheOnly(src FilterSource) (ParseResult, error) {
+	if src.URL != "" {
+		cachePath := l.cachePath(src.URL)
+		cached := l.loadCache(cachePath)
+		if cached == nil {
+			return ParseResult{}, fmt.Errorf("no cache for %s", src.URL)
+		}
+		return ParseRules(strings.NewReader(string(cached))), nil
+	}
+	if src.File != "" {
+		return l.loadFromFile(src.File)
+	}
+	return ParseResult{}, fmt.Errorf("source has neither url nor file")
+}
+
+// loadFromURL downloads rules from a URL with conditional request support.
+// Uses ! Last modified: from file content as If-Modified-Since.
+// On 304 Not Modified or content unchanged: returns cached result (no rebuild needed).
+// On network failure: falls back to local cache.
 func (l *Loader) loadFromURL(url string) (ParseResult, error) {
 	cachePath := l.cachePath(url)
 
-	// Try remote download
-	data, err := l.fetchURL(url)
-	if err == nil {
-		// Save to cache
+	cached := l.loadCache(cachePath)
+	meta := l.loadMeta(cachePath)
+
+	// Build If-Modified-Since from cached content's ! Last modified:
+	ifModifiedSince := ""
+	if meta.ContentModified != "" {
+		ifModifiedSince = meta.ContentModified
+	} else if cached != nil {
+		ifModifiedSince = parseLastModifiedFromContent(string(cached))
+	}
+
+	data, statusCode, _, err := l.fetchURL(url, ifModifiedSince, "")
+	if err == nil && statusCode == http.StatusNotModified {
+		log.Debugf("Remote %s not modified (304), using cache", url)
+		if cached != nil {
+			return ParseRules(strings.NewReader(string(cached))), nil
+		}
+	}
+	if err == nil && statusCode == http.StatusOK {
+		newContent := string(data)
+		newModified := extractLastModified(newContent)
+		newVersion := extractVersion(newContent)
+
+		// Compare content identifiers: if same, skip trie rebuild
+		if cached != nil {
+			cachedContent := string(cached)
+			cachedModified := extractLastModified(cachedContent)
+			cachedVersion := extractVersion(cachedContent)
+			if newModified != "" && newModified == cachedModified &&
+				newVersion == cachedVersion {
+				log.Debugf("Content %s unchanged (%s), skipping rebuild", url, newModified)
+				l.saveCache(cachePath, data)
+				result := ParseRules(strings.NewReader(cachedContent))
+				result.SkipUpdate = true
+				return result, nil
+			}
+		}
+
+		// Content changed: save cache + meta, parse and return
 		l.saveCache(cachePath, data)
-		result := ParseRules(strings.NewReader(string(data)))
-		return result, nil
+		l.saveMeta(cachePath, cacheMeta{
+			ContentModified: newModified,
+			ContentVersion:  newVersion,
+		})
+		return ParseRules(strings.NewReader(newContent)), nil
 	}
 
 	// Remote failed, try cache
-	log.Warningf("Failed to download %s: %v, trying cache", url, err)
-	cached := l.loadCache(cachePath)
 	if cached != nil {
-		log.Infof("Loaded rules from cache: %s", cachePath)
-		result := ParseRules(strings.NewReader(string(cached)))
-		return result, nil
+		log.Warningf("Failed to download %s: %v, using cache", url, err)
+		return ParseRules(strings.NewReader(string(cached))), nil
 	}
 
 	return ParseResult{}, fmt.Errorf("download failed and no cache available: %w", err)
+}
+
+// extractLastModified returns the raw ! Last modified: value from content.
+func extractLastModified(content string) string {
+	for _, line := range strings.Split(content, "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "! Last modified:") {
+			return strings.TrimSpace(line[len("! Last modified:"):])
+		}
+	}
+	return ""
+}
+
+// extractVersion returns the raw ! Version: value from content.
+func extractVersion(content string) string {
+	for _, line := range strings.Split(content, "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "! Version:") {
+			return strings.TrimSpace(line[len("! Version:"):])
+		}
+	}
+	return ""
 }
 
 // loadFromFile reads rules from a local file.
@@ -169,26 +373,44 @@ func (l *Loader) loadFromFile(path string) (ParseResult, error) {
 	return ParseRules(r), nil
 }
 
-// fetchURL performs an HTTP GET and returns the response body as bytes.
-func (l *Loader) fetchURL(url string) ([]byte, error) {
-	resp, err := l.client.Get(url)
+// fetchURL performs an HTTP GET with optional conditional headers.
+// Returns the body bytes, status code, response headers, and any error.
+// For 304 Not Modified, the body will be nil with no error.
+func (l *Loader) fetchURL(url, ifModifiedSince, ifNoneMatch string) ([]byte, int, http.Header, error) {
+	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
-		return nil, err
+		return nil, 0, nil, err
+	}
+	if ifModifiedSince != "" {
+		req.Header.Set("If-Modified-Since", ifModifiedSince)
+	}
+	if ifNoneMatch != "" {
+		req.Header.Set("If-None-Match", ifNoneMatch)
+	}
+
+	resp, err := l.client.Do(req)
+	if err != nil {
+		return nil, 0, nil, err
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return nil, &httpError{URL: url, StatusCode: resp.StatusCode}
+
+	if resp.StatusCode == http.StatusNotModified {
+		return nil, resp.StatusCode, resp.Header, nil
 	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, resp.StatusCode, resp.Header, &httpError{URL: url, StatusCode: resp.StatusCode}
+	}
+
 	data, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return nil, err
+		return nil, resp.StatusCode, resp.Header, err
 	}
-	return data, nil
+	return data, resp.StatusCode, resp.Header, nil
 }
 
 // StartPeriodicRefresh starts a goroutine that periodically reloads rules.
 // Returns a stop channel that should be closed on shutdown.
-// Skips reload if the previous one is still running (prevents memory buildup).
+// Uses conditional HTTP requests to skip downloads when content hasn't changed.
 func (l *Loader) StartPeriodicRefresh(onUpdate func()) chan struct{} {
 	stop := make(chan struct{})
 	if l.interval <= 0 {
@@ -230,6 +452,7 @@ func mergeResult(dst *ParseResult, src ParseResult) {
 	dst.Allowlist = append(dst.Allowlist, src.Allowlist...)
 	dst.RegexBlock = append(dst.RegexBlock, src.RegexBlock...)
 	dst.RegexAllow = append(dst.RegexAllow, src.RegexAllow...)
+	dst.SkipUpdate = dst.SkipUpdate && src.SkipUpdate
 }
 
 type httpError struct {

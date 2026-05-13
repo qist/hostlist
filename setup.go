@@ -22,8 +22,20 @@ func setup(c *caddy.Controller) error {
 	}
 
 	c.OnStartup(func() error {
-		result := h.loader.LoadAll()
-		h.Update(result)
+		// Phase 1: Load from cache immediately (no network, instant startup)
+		cachedResult := h.loader.LoadFromCache()
+		if cachedResult.Blocked != nil || cachedResult.BlockedExact != nil || cachedResult.Allowlist != nil {
+			h.Update(cachedResult)
+			log.Infof("Loaded %d domains from cache, starting async refresh",
+				len(cachedResult.Blocked)+len(cachedResult.BlockedExact))
+		}
+
+		// Phase 2: Async refresh in background (download latest rules)
+		go func() {
+			result := h.loader.LoadAll()
+			h.Update(result)
+		}()
+
 		return nil
 	})
 
@@ -47,9 +59,9 @@ func setup(c *caddy.Controller) error {
 
 func parse(c *caddy.Controller) (*Hostlist, error) {
 	h := &Hostlist{
-		Origins:   plugin.OriginsFromArgsOrServerBlock(nil, c.ServerBlockKeys),
-		mode:      "blacklist",
-		blockType: "0.0.0.0",
+		Origins:    plugin.OriginsFromArgsOrServerBlock(nil, c.ServerBlockKeys),
+		mode:       "blacklist",
+		blockType:  "0.0.0.0",
 		domainTrie: NewTrie(),
 		exactTrie:  NewTrie(),
 		allowTrie:  NewTrie(),
@@ -185,7 +197,7 @@ func parse(c *caddy.Controller) (*Hostlist, error) {
 					sources = append(sources,
 						FilterSource{URL: "https://adguardteam.github.io/HostlistsRegistry/assets/filter_24.txt"}, // HaGeZi's Gambling
 						FilterSource{URL: "https://adguardteam.github.io/HostlistsRegistry/assets/filter_9.txt"},  // Hacked Malware
-						FilterSource{URL: "https://adguardteam.github.io/HostlistsRegistry/assets/filter_15.txt"},  // AdGuard Adult filter (NSFW content)
+						FilterSource{URL: "https://adguardteam.github.io/HostlistsRegistry/assets/filter_15.txt"}, // AdGuard Adult filter (NSFW content)
 					)
 				case "off", "false":
 					// do nothing

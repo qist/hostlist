@@ -17,6 +17,7 @@ type ParseResult struct {
 	Allowlist    []string // @@||domain^ rules
 	RegexBlock   []string // /REGEX/ patterns
 	RegexAllow   []string // @@/REGEX/ patterns
+	SkipUpdate   bool     // true if content unchanged, caller should skip trie rebuild
 }
 
 // ParseRules reads AdGuard-format rules from r and extracts domains.

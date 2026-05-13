@@ -129,7 +129,13 @@ func (h *Hostlist) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *dns.Ms
 }
 
 // Update rebuilds the tries and regexps from a ParseResult via atomic swap.
+// If SkipUpdate is true (content unchanged), the rebuild is skipped.
 func (h *Hostlist) Update(result ParseResult) {
+	if result.SkipUpdate {
+		log.Debugf("Content unchanged, skipping trie rebuild")
+		return
+	}
+
 	newDomain := NewTrie()
 	newExact := NewTrie()
 	newAllow := NewTrie()
