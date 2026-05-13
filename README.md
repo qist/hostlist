@@ -172,8 +172,10 @@ hostlist {
 `safesearch on` 强制搜索引擎使用安全模式，将查询重写到安全搜索域名。
 
 ```
-hostlist {
-    safesearch on
+. {
+    hostlist {
+        safesearch on
+    }
     forward . 8.8.8.8:53
 }
 ```
@@ -199,8 +201,10 @@ hostlist {
 `parental on` 自动加载赌博和恶意软件过滤列表。
 
 ```
-hostlist {
-    parental on
+. {
+    hostlist {
+        parental on
+    }
     forward . 8.8.8.8:53
 }
 ```
