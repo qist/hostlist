@@ -187,9 +187,17 @@ func parse(c *caddy.Controller) (*Hostlist, error) {
 				case "on", "true":
 					// Add parental control filter URLs (gambling + NSFW)
 					sources = append(sources,
-						FilterSource{URL: "https://adguardteam.github.io/HostlistsRegistry/assets/filter_24.txt"}, // HaGeZi's Gambling
-						FilterSource{URL: "https://adguardteam.github.io/HostlistsRegistry/assets/filter_9.txt"},  // Hacked Malware
-						FilterSource{URL: "https://adguardteam.github.io/HostlistsRegistry/assets/filter_15.txt"}, // AdGuard Adult filter (NSFW content)
+						FilterSource{
+							URL: "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/adblock/gambling.medium.txt",
+						}, // Gambling
+
+						FilterSource{
+							URL: "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/adblock/tif.medium.txt",
+						}, // Malware / Phishing / Scam
+
+						FilterSource{
+							URL: "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/adblock/nsfw.txt",
+						}, // NSFW / Adult
 					)
 				case "off", "false":
 					// do nothing
