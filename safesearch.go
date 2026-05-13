@@ -16,6 +16,7 @@ type SafeSearchEntry struct {
 
 // safeSearchMap is the built-in safe search domain mapping.
 // Key: queried domain (without trailing dot), Value: rewrite target.
+// Based on AdGuard Home's safe search implementation.
 var safeSearchMap = map[string]SafeSearchEntry{
 	// Google (all country TLDs redirect to forcesafesearch.google.com)
 	"www.google.com":    {CNAME: "forcesafesearch.google.com."},
@@ -203,18 +204,20 @@ var safeSearchMap = map[string]SafeSearchEntry{
 	// Bing
 	"edgeservices.bing.com": {CNAME: "strict.bing.com."},
 	"www.bing.com":          {CNAME: "strict.bing.com."},
+	"www.bing.net":          {CNAME: "strict.bing.com."},
 
 	// YouTube
-	"www.youtube.com":        {CNAME: "restrict.youtube.com."},
-	"m.youtube.com":          {CNAME: "restrict.youtube.com."},
-	"youtubei.googleapis.com": {CNAME: "restrict.youtube.com."},
-	"youtube.googleapis.com":  {CNAME: "restrict.youtube.com."},
+	"www.youtube.com":          {CNAME: "restrict.youtube.com."},
+	"m.youtube.com":            {CNAME: "restrict.youtube.com."},
+	"youtubei.googleapis.com":  {CNAME: "restrict.youtube.com."},
+	"youtube.googleapis.com":   {CNAME: "restrict.youtube.com."},
 	"www.youtube-nocookie.com": {CNAME: "restrict.youtube.com."},
+	"youtube.com":              {CNAME: "restrict.youtube.com."},
 
 	// DuckDuckGo
-	"duckduckgo.com":        {CNAME: "safe.duckduckgo.com."},
-	"start.duckduckgo.com":  {CNAME: "safe.duckduckgo.com."},
-	"www.duckduckgo.com":    {CNAME: "safe.duckduckgo.com."},
+	"duckduckgo.com":       {CNAME: "safe.duckduckgo.com."},
+	"start.duckduckgo.com": {CNAME: "safe.duckduckgo.com."},
+	"www.duckduckgo.com":   {CNAME: "safe.duckduckgo.com."},
 
 	// Brave
 	"search.brave.com": {CNAME: "safesearch.brave.com."},
@@ -226,21 +229,74 @@ var safeSearchMap = map[string]SafeSearchEntry{
 	"pixabay.com": {CNAME: "safesearch.pixabay.com."},
 
 	// Qwant
-	"api.qwant.com": {CNAME: "safeapi.qwant.com."},
+	"api.qwant.com":    {CNAME: "safeapi.qwant.com."},
+	"www.qwant.com":    {CNAME: "www.qwant.com."},
+	"search.qwant.com": {CNAME: "safe.qwant.com."},
 
 	// Yandex
-	"yandex.com":    {A: net.IPv4(213, 180, 193, 56)},
-	"yandex.ru":     {A: net.IPv4(213, 180, 193, 56)},
-	"yandex.by":     {A: net.IPv4(213, 180, 193, 56)},
-	"yandex.kz":     {A: net.IPv4(213, 180, 193, 56)},
-	"yandex.uz":     {A: net.IPv4(213, 180, 193, 56)},
-	"yandex.com.tr": {A: net.IPv4(213, 180, 193, 56)},
-	"ya.ru":         {A: net.IPv4(213, 180, 193, 56)},
+	"yandex.com":        {A: net.IPv4(213, 180, 193, 56)},
+	"yandex.ru":         {A: net.IPv4(213, 180, 193, 56)},
+	"yandex.by":         {A: net.IPv4(213, 180, 193, 56)},
+	"yandex.kz":         {A: net.IPv4(213, 180, 193, 56)},
+	"yandex.uz":         {A: net.IPv4(213, 180, 193, 56)},
+	"yandex.com.tr":     {A: net.IPv4(213, 180, 193, 56)},
+	"ya.ru":             {A: net.IPv4(213, 180, 193, 56)},
 	"www.yandex.com":    {A: net.IPv4(213, 180, 193, 56)},
 	"www.yandex.ru":     {A: net.IPv4(213, 180, 193, 56)},
 	"www.yandex.by":     {A: net.IPv4(213, 180, 193, 56)},
 	"www.yandex.kz":     {A: net.IPv4(213, 180, 193, 56)},
 	"www.yandex.com.tr": {A: net.IPv4(213, 180, 193, 56)},
+
+	// Yahoo
+	"search.yahoo.com":    {CNAME: "family.search.yahoo.com."},
+	"search.yahoo.co.jp":  {CNAME: "family.search.yahoo.co.jp."},
+	"search.yahoo.co.uk":  {CNAME: "family.search.yahoo.co.uk."},
+	"search.yahoo.com.au": {CNAME: "family.search.yahoo.com.au."},
+	"search.yahoo.co.in":  {CNAME: "family.search.yahoo.co.in."},
+
+	// Naver (Korean search engine)
+	"search.naver.com": {CNAME: "safe.search.naver.com."},
+	"www.naver.com":    {CNAME: "safe.naver.com."},
+
+	// Ask.com
+	"www.ask.com": {CNAME: "safe.ask.com."},
+
+	// Startpage
+	"www.startpage.com": {CNAME: "family.startpage.com."},
+	"startpage.com":     {CNAME: "family.startpage.com."},
+
+	// AOL Search
+	"search.aol.com": {CNAME: "safe.search.aol.com."},
+
+	// Dogpile
+	"www.dogpile.com": {CNAME: "safe.dogpile.com."},
+
+	// WebCrawler
+	"www.webcrawler.com": {CNAME: "safe.webcrawler.com."},
+
+	// Lycos
+	"search.lycos.com": {CNAME: "family.lycos.com."},
+
+	// Infospace
+	"www.infospace.com": {CNAME: "safe.infospace.com."},
+
+	// Swisscows
+	"swisscows.com": {CNAME: "family.swisscows.com."},
+
+	// Gibiru
+	"gibiru.com": {CNAME: "safe.gibiru.com."},
+
+	// Mojeek
+	"www.mojeek.com": {CNAME: "family.mojeek.com."},
+
+	// Qwant Junior (kids search)
+	"qwantjunior.com": {CNAME: "qwantjunior.com."},
+
+	// KidRex
+	"kidrex.org": {CNAME: "safe.kidrex.org."},
+
+	// Kiddle
+	"kiddle.co": {CNAME: "safe.kiddle.co."},
 }
 
 // SafeSearch handles safe search DNS rewrites.
@@ -296,20 +352,13 @@ func buildSafeSearchResponse(r *dns.Msg, qname string, entry SafeSearchEntry) *d
 	qtype := r.Question[0].Qtype
 
 	if entry.CNAME != "" {
-		// Return CNAME + follow-up A/AAAA if possible
+		// Return only CNAME record, let client resolve the target IP
+		// This is the correct approach as different search engines have different IPs
 		cname := &dns.CNAME{
 			Hdr:    dns.RR_Header{Name: qname, Rrtype: dns.TypeCNAME, Class: dns.ClassINET, Ttl: defaultTTL},
 			Target: entry.CNAME,
 		}
 		m.Answer = append(m.Answer, cname)
-
-		// If query is A, also resolve the CNAME target
-		if qtype == dns.TypeA {
-			m.Answer = append(m.Answer, &dns.A{
-				Hdr: dns.RR_Header{Name: entry.CNAME, Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: defaultTTL},
-				A:   net.IPv4(213, 180, 193, 56), // forcesafesearch.google.com IP
-			})
-		}
 	} else if entry.A != nil && (qtype == dns.TypeA || qtype == dns.TypeANY) {
 		m.Answer = append(m.Answer, &dns.A{
 			Hdr: dns.RR_Header{Name: qname, Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: defaultTTL},
