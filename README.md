@@ -27,6 +27,8 @@ hostlist {
     blocklist <rule>              # 用户黑名单规则（可重复）
     mode blacklist|whitelist      # 模式，默认 blacklist
     block_type 0.0.0.0|nxdomain|empty  # 拦截响应类型，默认 0.0.0.0
+    safesearch on|off             # 安全搜索，默认 off
+    parental on|off               # 家长控制，默认 off
     refresh <duration>            # 远程同步间隔，默认 4d
     cache_dir <path>              # 缓存目录，默认 ./hostlist/
 }
@@ -164,6 +166,48 @@ hostlist {
 - 按 `refresh` 间隔定时重新下载远程规则
 - 下载失败时使用本地缓存文件
 - 所有错误（网络超时、文件不存在等）均跳过，不影响进程
+
+## 安全搜索
+
+`safesearch on` 强制搜索引擎使用安全模式，将查询重写到安全搜索域名。
+
+```
+hostlist {
+    safesearch on
+    forward . 8.8.8.8:53
+}
+```
+
+支持的搜索引擎：
+
+| 引擎 | 重写目标 |
+|------|---------|
+| Google（190+ 国家域名） | `forcesafesearch.google.com` |
+| Bing | `strict.bing.com` |
+| YouTube | `restrict.youtube.com` |
+| DuckDuckGo | `safe.duckduckgo.com` |
+| Brave | `safesearch.brave.com` |
+| Ecosia | `strict-safe-search.ecosia.org` |
+| Yandex | `213.180.193.56` |
+| Pixabay | `safesearch.pixabay.com` |
+| Qwant | `safeapi.qwant.com` |
+
+查询 `www.google.com` 时返回 CNAME `forcesafesearch.google.com`，客户端会自动解析到 Google 安全搜索。
+
+## 家长控制
+
+`parental on` 自动加载赌博和恶意软件过滤列表。
+
+```
+hostlist {
+    parental on
+    forward . 8.8.8.8:53
+}
+```
+
+启用后自动加载：
+- HaGeZi's Gambling Blocklist（赌博网站）
+- The Big List of Hacked Malware Web Sites（恶意软件）
 
 ## 缓存目录
 

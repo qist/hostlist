@@ -31,9 +31,10 @@ type Hostlist struct {
 	allowRegexps []*regexp.Regexp // @@/REGEX/ compiled patterns
 	mu           sync.RWMutex
 
-	mode      string // "blacklist" | "whitelist"
-	blockType string // "nxdomain" | "empty"
-	loader    *Loader
+	mode       string      // "blacklist" | "whitelist"
+	blockType  string      // "0.0.0.0" | "nxdomain" | "empty"
+	safeSearch *SafeSearch // safe search handler
+	loader     *Loader
 }
 
 func (h *Hostlist) Name() string { return pluginName }
@@ -64,6 +65,15 @@ func (h *Hostlist) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *dns.Ms
 	zone := plugin.Zones(h.Origins).Matches(qname)
 	if zone == "" {
 		return plugin.NextOrFailure(h.Name(), h.Next, ctx, w, r)
+	}
+
+	// Safe search check (before blocklist, takes priority)
+	if h.safeSearch != nil && h.safeSearch.Enabled() {
+		if entry, ok := h.safeSearch.Lookup(qname); ok {
+			m := buildSafeSearchResponse(r, qname, entry)
+			w.WriteMsg(m)
+			return m.Rcode, nil
+		}
 	}
 
 	name := strings.ToLower(qname)

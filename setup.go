@@ -162,6 +162,36 @@ func parse(c *caddy.Controller) (*Hostlist, error) {
 				}
 				cacheDir = d
 
+			case "safesearch":
+				if !c.NextArg() {
+					return nil, c.ArgErr()
+				}
+				switch c.Val() {
+				case "on", "true":
+					h.safeSearch = NewSafeSearch(true)
+				case "off", "false":
+					h.safeSearch = NewSafeSearch(false)
+				default:
+					return nil, c.Errf("invalid safesearch value %q, must be 'on' or 'off'", c.Val())
+				}
+
+			case "parental":
+				if !c.NextArg() {
+					return nil, c.ArgErr()
+				}
+				switch c.Val() {
+				case "on", "true":
+					// Add parental control filter URLs (gambling + NSFW)
+					sources = append(sources,
+						FilterSource{URL: "https://adguardteam.github.io/HostlistsRegistry/assets/filter_47.txt"}, // HaGeZi's Gambling
+						FilterSource{URL: "https://adguardteam.github.io/HostlistsRegistry/assets/filter_9.txt"},  // Hacked Malware
+					)
+				case "off", "false":
+					// do nothing
+				default:
+					return nil, c.Errf("invalid parental value %q, must be 'on' or 'off'", c.Val())
+				}
+
 			default:
 				return nil, c.Errf("unknown property %q", c.Val())
 			}
