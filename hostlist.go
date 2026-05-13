@@ -180,11 +180,27 @@ func (h *Hostlist) Update(result ParseResult) {
 }
 
 // isBypassIP checks if the given IP is in the bypass whitelist.
+// It handles IPv6-mapped IPv4 addresses (e.g., ::ffff:172.18.44.255).
 func (h *Hostlist) isBypassIP(ip string) bool {
 	clientIP := net.ParseIP(ip)
 	if clientIP == nil {
 		return false
 	}
+
+	// Convert IPv6-mapped IPv4 address to pure IPv4 for matching
+	// e.g., ::ffff:172.18.44.255 -> 172.18.44.255
+	if clientIP.To4() != nil {
+		// Already a pure IPv4 address
+	} else if ipv6 := clientIP.To16(); ipv6 != nil {
+		// Check if it's an IPv6-mapped IPv4 address (::ffff:x.x.x.x)
+		if ipv6[0] == 0 && ipv6[1] == 0 && ipv6[2] == 0 && ipv6[3] == 0 &&
+			ipv6[4] == 0 && ipv6[5] == 0 && ipv6[6] == 0 && ipv6[7] == 0 &&
+			ipv6[8] == 0 && ipv6[9] == 0 && ipv6[10] == 0xff && ipv6[11] == 0xff {
+			// Extract the IPv4 part and convert to net.IPv4
+			clientIP = net.IPv4(ipv6[12], ipv6[13], ipv6[14], ipv6[15])
+		}
+	}
+
 	for _, cidr := range h.bypassIPs {
 		if cidr.Contains(clientIP) {
 			return true
