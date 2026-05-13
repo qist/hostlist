@@ -16,9 +16,9 @@ func TestParseAdblockRules(t *testing.T) {
 		t.Fatalf("expected 3 blocked domains, got %d: %v", len(result.Blocked), result.Blocked)
 	}
 	expected := map[string]bool{
-		"ads.example.com.": true,
+		"ads.example.com.":   true,
 		"tracker.other.com.": true,
-		"blocked.org.":     true,
+		"blocked.org.":       true,
 	}
 	for _, d := range result.Blocked {
 		if !expected[d] {
@@ -38,6 +38,30 @@ func TestParseExceptionRules(t *testing.T) {
 	}
 	if len(result.Allowlist) != 2 {
 		t.Fatalf("expected 2 allowlist, got %d: %v", len(result.Allowlist), result.Allowlist)
+	}
+}
+
+func TestParseRulesDeduplicates(t *testing.T) {
+	input := `||ads.example.com^
+||ADS.example.com^
+127.0.0.1 exact.example.com exact.example.com
+@@||allow.example.com^
+@@||ALLOW.example.com^
+/^ad[0-9]+\.example\.com$/
+/^ad[0-9]+\.example\.com$/
+`
+	result := ParseRules(strings.NewReader(input))
+	if len(result.Blocked) != 1 {
+		t.Fatalf("expected 1 unique blocked domain, got %d: %v", len(result.Blocked), result.Blocked)
+	}
+	if len(result.BlockedExact) != 1 {
+		t.Fatalf("expected 1 unique exact domain, got %d: %v", len(result.BlockedExact), result.BlockedExact)
+	}
+	if len(result.Allowlist) != 1 {
+		t.Fatalf("expected 1 unique allowlist domain, got %d: %v", len(result.Allowlist), result.Allowlist)
+	}
+	if len(result.RegexBlock) != 1 {
+		t.Fatalf("expected 1 unique block regex, got %d: %v", len(result.RegexBlock), result.RegexBlock)
 	}
 }
 

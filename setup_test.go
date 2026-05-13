@@ -75,3 +75,26 @@ func TestParse(t *testing.T) {
 		}
 	}
 }
+
+func TestParseDeduplicatesConfigRulesAndSources(t *testing.T) {
+	c := caddy.NewTestController("dns", `hostlist {
+		url https://example.com/filter.txt
+		url https://example.com/filter.txt
+		file /etc/coredns/blocklist.txt
+		file /etc/coredns/blocklist.txt
+		allowlist @@||youtube.com^ @@||youtube.com^
+		blocklist ||ads.example.com^ ||ads.example.com^
+		parental on
+		parental on
+	}`)
+	h, err := parse(c)
+	if err != nil {
+		t.Fatalf("expected no error, got: %v", err)
+	}
+	if got, want := len(h.loader.sources), 5; got != want {
+		t.Fatalf("expected %d unique sources, got %d: %#v", want, got, h.loader.sources)
+	}
+	if got, want := len(h.loader.userRules), 2; got != want {
+		t.Fatalf("expected %d unique user rules, got %d: %#v", want, got, h.loader.userRules)
+	}
+}

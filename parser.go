@@ -23,6 +23,11 @@ type ParseResult struct {
 // ParseRules reads AdGuard-format rules from r and extracts domains.
 func ParseRules(r io.Reader) ParseResult {
 	var result ParseResult
+	seenBlocked := make(map[string]struct{})
+	seenBlockedExact := make(map[string]struct{})
+	seenAllowlist := make(map[string]struct{})
+	seenRegexBlock := make(map[string]struct{})
+	seenRegexAllow := make(map[string]struct{})
 	scanner := bufio.NewScanner(r)
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
@@ -43,7 +48,7 @@ func ParseRules(r io.Reader) ParseResult {
 			rest := line[2:]
 			// @@/REGEX/
 			if strings.HasPrefix(rest, "/") && strings.HasSuffix(rest, "/") && len(rest) > 1 {
-				result.RegexAllow = append(result.RegexAllow, rest[1:len(rest)-1])
+				result.RegexAllow = appendUnique(result.RegexAllow, seenRegexAllow, rest[1:len(rest)-1])
 				continue
 			}
 			// @@||domain^ or @@|domain^
@@ -62,7 +67,7 @@ func ParseRules(r io.Reader) ParseResult {
 				}
 				domain := extractAdblockDomain(domainPart)
 				if domain != "" {
-					result.Allowlist = append(result.Allowlist, normalizeDomain(domain))
+					result.Allowlist = appendUnique(result.Allowlist, seenAllowlist, normalizeDomain(domain))
 				}
 			}
 			continue
@@ -70,7 +75,7 @@ func ParseRules(r io.Reader) ParseResult {
 
 		// /REGEX/ rules
 		if line[0] == '/' && strings.HasSuffix(line, "/") && len(line) > 1 {
-			result.RegexBlock = append(result.RegexBlock, line[1:len(line)-1])
+			result.RegexBlock = appendUnique(result.RegexBlock, seenRegexBlock, line[1:len(line)-1])
 			continue
 		}
 
@@ -91,10 +96,10 @@ func ParseRules(r io.Reader) ParseResult {
 				if strings.Contains(domain, "*") {
 					// Wildcard: convert to regex
 					if re := wildcardToRegex(domain); re != "" {
-						result.RegexBlock = append(result.RegexBlock, re)
+						result.RegexBlock = appendUnique(result.RegexBlock, seenRegexBlock, re)
 					}
 				} else {
-					result.Blocked = append(result.Blocked, normalizeDomain(domain))
+					result.Blocked = appendUnique(result.Blocked, seenBlocked, normalizeDomain(domain))
 				}
 			}
 			continue
@@ -106,10 +111,10 @@ func ParseRules(r io.Reader) ParseResult {
 			if domain != "" {
 				if strings.Contains(domain, "*") {
 					if re := wildcardToRegex(domain); re != "" {
-						result.RegexBlock = append(result.RegexBlock, re)
+						result.RegexBlock = appendUnique(result.RegexBlock, seenRegexBlock, re)
 					}
 				} else {
-					result.Blocked = append(result.Blocked, normalizeDomain(domain))
+					result.Blocked = appendUnique(result.Blocked, seenBlocked, normalizeDomain(domain))
 				}
 			}
 			continue
@@ -117,20 +122,33 @@ func ParseRules(r io.Reader) ParseResult {
 
 		// Hosts format: 127.0.0.1 domain or 0.0.0.0 domain
 		if hostsDomains := parseHostsLine(line); len(hostsDomains) > 0 {
-			result.BlockedExact = append(result.BlockedExact, hostsDomains...)
+			for _, domain := range hostsDomains {
+				result.BlockedExact = appendUnique(result.BlockedExact, seenBlockedExact, domain)
+			}
 			continue
 		}
 
 		// Plain domain rules: .domain^ or domain (without ||)
 		// These are less common but appear in some filter lists
 		if domain := extractPlainDomain(line); domain != "" {
-			result.Blocked = append(result.Blocked, normalizeDomain(domain))
+			result.Blocked = appendUnique(result.Blocked, seenBlocked, normalizeDomain(domain))
 			continue
 		}
 
 		// Everything else is ignored (cosmetic rules, unknown modifiers, etc.)
 	}
 	return result
+}
+
+func appendUnique(values []string, seen map[string]struct{}, value string) []string {
+	if value == "" {
+		return values
+	}
+	if _, ok := seen[value]; ok {
+		return values
+	}
+	seen[value] = struct{}{}
+	return append(values, value)
 }
 
 // extractAdblockDomain extracts the domain from an adblock rule.

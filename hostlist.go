@@ -7,7 +7,7 @@ import (
 	"runtime"
 	"runtime/debug"
 	"strings"
-	"sync"
+	"sync/atomic"
 
 	"github.com/coredns/coredns/plugin"
 	"github.com/coredns/coredns/plugin/metrics"
@@ -24,12 +24,13 @@ type Hostlist struct {
 	Next    plugin.Handler
 	Origins []string
 
+	rules atomic.Value // stores *ruleSet; published as a complete immutable snapshot
+
 	domainTrie   *Trie            // ||domain^ rules (ancestor match)
 	exactTrie    *Trie            // hosts format rules (exact match)
 	allowTrie    *Trie            // @@||domain^ rules (ancestor match)
 	blockRegexps []*regexp.Regexp // /REGEX/ compiled patterns
 	allowRegexps []*regexp.Regexp // @@/REGEX/ compiled patterns
-	mu           sync.RWMutex
 
 	mode       string      // "blacklist" | "whitelist"
 	blockType  string      // "0.0.0.0" | "nxdomain" | "empty"
@@ -37,6 +38,14 @@ type Hostlist struct {
 	loader     *Loader
 
 	bypassIPs []net.IPNet // client IPs that bypass parental control and safe search
+}
+
+type ruleSet struct {
+	domainTrie   *Trie
+	exactTrie    *Trie
+	allowTrie    *Trie
+	blockRegexps []*regexp.Regexp
+	allowRegexps []*regexp.Regexp
 }
 
 func (h *Hostlist) Name() string { return pluginName }
@@ -86,13 +95,12 @@ func (h *Hostlist) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *dns.Ms
 
 	name := strings.ToLower(qname)
 
-	h.mu.RLock()
-	domainBlocked := h.domainTrie.Lookup(name)
-	exactBlocked := h.exactTrie.Lookup(name)
-	allowed := h.allowTrie.Lookup(name)
-	blockRegex := MatchAny(name, h.blockRegexps)
-	allowRegex := MatchAny(name, h.allowRegexps)
-	h.mu.RUnlock()
+	rules := h.currentRules()
+	domainBlocked := rules.domainTrie.Lookup(name)
+	exactBlocked := rules.exactTrie.Lookup(name)
+	allowed := rules.allowTrie.Lookup(name)
+	blockRegex := MatchAny(name, rules.blockRegexps)
+	allowRegex := MatchAny(name, rules.allowRegexps)
 
 	blocked := domainBlocked || exactBlocked || blockRegex
 	if allowRegex {
@@ -138,10 +146,10 @@ func (h *Hostlist) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *dns.Ms
 
 // Update rebuilds the tries and regexps from a ParseResult via atomic swap.
 // If SkipUpdate is true (content unchanged), the rebuild is skipped.
-// This method uses a safe memory management strategy: old data is released
-// before new data is loaded to avoid having two copies in memory simultaneously.
+// A new immutable snapshot is built off to the side and published in one store,
+// so queries never observe nil or partially rebuilt rules.
 func (h *Hostlist) Update(result ParseResult) {
-	if result.SkipUpdate {
+	if result.SkipUpdate && h.rules.Load() != nil {
 		log.Debugf("Content unchanged, skipping trie rebuild")
 		return
 	}
@@ -163,24 +171,14 @@ func (h *Hostlist) Update(result ParseResult) {
 	newBlockRe := CompileRegexps(result.RegexBlock)
 	newAllowRe := CompileRegexps(result.RegexAllow)
 
-	// Safe memory management: release old data before acquiring new data
-	// This avoids having two large copies in memory at the same time
-	h.mu.Lock()
-	h.domainTrie = nil
-	h.exactTrie = nil
-	h.allowTrie = nil
-	h.blockRegexps = nil
-	h.allowRegexps = nil
-	h.mu.Unlock()
-
-	// Now acquire lock and set new data
-	h.mu.Lock()
-	h.domainTrie = newDomain
-	h.exactTrie = newExact
-	h.allowTrie = newAllow
-	h.blockRegexps = newBlockRe
-	h.allowRegexps = newAllowRe
-	h.mu.Unlock()
+	newRules := &ruleSet{
+		domainTrie:   newDomain,
+		exactTrie:    newExact,
+		allowTrie:    newAllow,
+		blockRegexps: newBlockRe,
+		allowRegexps: newAllowRe,
+	}
+	h.rules.Store(newRules)
 
 	total := newDomain.Len() + newExact.Len()
 	DomainsLoaded.Set(float64(total))
@@ -192,12 +190,10 @@ func (h *Hostlist) Update(result ParseResult) {
 // This is called during shutdown to ensure proper memory cleanup,
 // especially important during reload operations.
 func (h *Hostlist) Cleanup() {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-
 	log.Infof("Hostlist: cleaning up resources")
 
 	// Clear all large data structures
+	h.rules.Store(emptyRuleSet())
 	h.domainTrie = nil
 	h.exactTrie = nil
 	h.allowTrie = nil
@@ -219,6 +215,34 @@ func (h *Hostlist) Cleanup() {
 	debug.FreeOSMemory()
 
 	log.Infof("Hostlist: cleanup completed")
+}
+
+func (h *Hostlist) currentRules() *ruleSet {
+	if v := h.rules.Load(); v != nil {
+		return v.(*ruleSet)
+	}
+	return &ruleSet{
+		domainTrie:   nonNilTrie(h.domainTrie),
+		exactTrie:    nonNilTrie(h.exactTrie),
+		allowTrie:    nonNilTrie(h.allowTrie),
+		blockRegexps: h.blockRegexps,
+		allowRegexps: h.allowRegexps,
+	}
+}
+
+func emptyRuleSet() *ruleSet {
+	return &ruleSet{
+		domainTrie: NewTrie(),
+		exactTrie:  NewTrie(),
+		allowTrie:  NewTrie(),
+	}
+}
+
+func nonNilTrie(t *Trie) *Trie {
+	if t != nil {
+		return t
+	}
+	return NewTrie()
 }
 
 // isBypassIP checks if the given IP is in the bypass whitelist.

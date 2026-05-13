@@ -45,9 +45,14 @@ func (in *Interner) Intern(s string) string {
 var labelInterner = NewInterner()
 
 type trieNode struct {
-	children map[string]*trieNode // nil until first child added (saves memory for leaf nodes)
-	blocked  bool                 // set by Insert: blocks this node AND all descendants
-	exact    bool                 // set by InsertExact: blocks ONLY this exact domain
+	children []trieChild // nil until first child added; slices are smaller than maps for typical DNS fanout
+	blocked  bool        // set by Insert: blocks this node AND all descendants
+	exact    bool        // set by InsertExact: blocks ONLY this exact domain
+}
+
+type trieChild struct {
+	label string
+	node  *trieNode
 }
 
 // Trie is a reversed-label trie for efficient DNS domain matching.
@@ -55,7 +60,7 @@ type trieNode struct {
 //
 // Memory optimizations:
 //   - String interning: identical label strings share memory via Interner
-//   - Lazy map allocation: leaf nodes have nil children map (no wasted memory)
+//   - Compact child slices: leaf nodes have nil children (no wasted memory)
 type Trie struct {
 	root   *trieNode
 	length int
@@ -83,15 +88,14 @@ func labels(domain string) []string {
 // getOrCreateChild returns the child node for label, creating it if needed.
 // The label is interned for memory deduplication.
 func (t *Trie) getOrCreateChild(node *trieNode, label string) *trieNode {
-	if node.children == nil {
-		node.children = make(map[string]*trieNode)
-	}
 	interned := labelInterner.Intern(label)
-	child, ok := node.children[interned]
-	if !ok {
-		child = &trieNode{}
-		node.children[interned] = child
+	for i := range node.children {
+		if node.children[i].label == interned {
+			return node.children[i].node
+		}
 	}
+	child := &trieNode{}
+	node.children = append(node.children, trieChild{label: interned, node: child})
 	return child
 }
 
@@ -150,17 +154,26 @@ func (t *Trie) Lookup(domain string) bool {
 		if node.blocked {
 			return true // ancestor match (Insert wildcard)
 		}
-		if node.children == nil {
+		if len(node.children) == 0 {
 			return false
 		}
-		child, ok := node.children[label]
-		if !ok {
+		child := node.child(label)
+		if child == nil {
 			return false
 		}
 		node = child
 	}
 	// Terminal node: check both blocked and exact
 	return node.blocked || node.exact
+}
+
+func (n *trieNode) child(label string) *trieNode {
+	for i := range n.children {
+		if n.children[i].label == label {
+			return n.children[i].node
+		}
+	}
+	return nil
 }
 
 // Len returns the number of entries in the trie.

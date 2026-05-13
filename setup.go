@@ -64,6 +64,9 @@ func parse(c *caddy.Controller) (*Hostlist, error) {
 	var sources []FilterSource
 	var allowSources []FilterSource
 	var userRules []string
+	seenSources := make(map[string]struct{})
+	seenAllowSources := make(map[string]struct{})
+	seenUserRules := make(map[string]struct{})
 	var cacheDir string
 	refreshInterval := 4 * 24 * time.Hour // default 4 days
 
@@ -81,7 +84,7 @@ func parse(c *caddy.Controller) (*Hostlist, error) {
 				if !c.NextArg() {
 					return nil, c.ArgErr()
 				}
-				sources = append(sources, FilterSource{URL: c.Val()})
+				sources = appendUniqueSource(sources, seenSources, FilterSource{URL: c.Val()})
 
 			case "file":
 				if !c.NextArg() {
@@ -91,13 +94,13 @@ func parse(c *caddy.Controller) (*Hostlist, error) {
 				if !filepath.IsAbs(f) && config.Root != "" {
 					f = filepath.Join(config.Root, f)
 				}
-				sources = append(sources, FilterSource{File: f})
+				sources = appendUniqueSource(sources, seenSources, FilterSource{File: f})
 
 			case "whitelist_url":
 				if !c.NextArg() {
 					return nil, c.ArgErr()
 				}
-				allowSources = append(allowSources, FilterSource{URL: c.Val()})
+				allowSources = appendUniqueSource(allowSources, seenAllowSources, FilterSource{URL: c.Val()})
 
 			case "whitelist_file":
 				if !c.NextArg() {
@@ -107,21 +110,23 @@ func parse(c *caddy.Controller) (*Hostlist, error) {
 				if !filepath.IsAbs(f) && config.Root != "" {
 					f = filepath.Join(config.Root, f)
 				}
-				allowSources = append(allowSources, FilterSource{File: f})
+				allowSources = appendUniqueSource(allowSources, seenAllowSources, FilterSource{File: f})
 
 			case "allowlist":
 				if !c.NextArg() {
 					return nil, c.ArgErr()
 				}
-				userRules = append(userRules, c.Val())
-				userRules = append(userRules, c.RemainingArgs()...)
+				for _, rule := range append([]string{c.Val()}, c.RemainingArgs()...) {
+					userRules = appendUniqueRule(userRules, seenUserRules, rule)
+				}
 
 			case "blocklist":
 				if !c.NextArg() {
 					return nil, c.ArgErr()
 				}
-				userRules = append(userRules, c.Val())
-				userRules = append(userRules, c.RemainingArgs()...)
+				for _, rule := range append([]string{c.Val()}, c.RemainingArgs()...) {
+					userRules = appendUniqueRule(userRules, seenUserRules, rule)
+				}
 
 			case "mode":
 				if !c.NextArg() {
@@ -188,19 +193,15 @@ func parse(c *caddy.Controller) (*Hostlist, error) {
 				switch c.Val() {
 				case "on", "true":
 					// Add parental control filter URLs (gambling + NSFW)
-					sources = append(sources,
-						FilterSource{
-							URL: "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/adblock/gambling.medium.txt",
-						}, // Gambling
-
-						FilterSource{
-							URL: "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/adblock/tif.medium.txt",
-						}, // Malware / Phishing / Scam
-
-						FilterSource{
-							URL: "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/adblock/nsfw.txt",
-						}, // NSFW / Adult
-					)
+					sources = appendUniqueSource(sources, seenSources, FilterSource{
+						URL: "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/adblock/gambling.medium.txt",
+					}) // Gambling
+					sources = appendUniqueSource(sources, seenSources, FilterSource{
+						URL: "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/adblock/tif.medium.txt",
+					}) // Malware / Phishing / Scam
+					sources = appendUniqueSource(sources, seenSources, FilterSource{
+						URL: "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/adblock/nsfw.txt",
+					}) // NSFW / Adult
 				case "off", "false":
 					// do nothing
 				default:
@@ -248,4 +249,29 @@ func parse(c *caddy.Controller) (*Hostlist, error) {
 
 	h.loader = NewLoader(sources, allowSources, userRules, refreshInterval, cacheDir)
 	return h, nil
+}
+
+func appendUniqueSource(sources []FilterSource, seen map[string]struct{}, source FilterSource) []FilterSource {
+	key := source.URL
+	if key == "" {
+		key = "file:" + source.File
+	} else {
+		key = "url:" + key
+	}
+	if _, ok := seen[key]; ok {
+		return sources
+	}
+	seen[key] = struct{}{}
+	return append(sources, source)
+}
+
+func appendUniqueRule(rules []string, seen map[string]struct{}, rule string) []string {
+	if rule == "" {
+		return rules
+	}
+	if _, ok := seen[rule]; ok {
+		return rules
+	}
+	seen[rule] = struct{}{}
+	return append(rules, rule)
 }

@@ -196,13 +196,13 @@ func TestServeDNSAAAA(t *testing.T) {
 
 func TestServeDNSRegex(t *testing.T) {
 	h := &Hostlist{
-		Next:        test.NextHandler(dns.RcodeSuccess, nil),
-		Origins:     []string{"."},
-		mode:        "blacklist",
-		blockType:   "nxdomain",
-		domainTrie:  NewTrie(),
-		exactTrie:   NewTrie(),
-		allowTrie:   NewTrie(),
+		Next:         test.NextHandler(dns.RcodeSuccess, nil),
+		Origins:      []string{"."},
+		mode:         "blacklist",
+		blockType:    "nxdomain",
+		domainTrie:   NewTrie(),
+		exactTrie:    NewTrie(),
+		allowTrie:    NewTrie(),
 		blockRegexps: CompileRegexps([]string{`^ads\d*\.`}),
 	}
 
@@ -213,5 +213,37 @@ func TestServeDNSRegex(t *testing.T) {
 	rcode, _ := h.ServeDNS(context.Background(), rec, req)
 	if rcode != dns.RcodeNameError {
 		t.Fatalf("expected NXDOMAIN for regex match, got %d", rcode)
+	}
+}
+
+func TestUpdateSkipDoesNotSkipInitialLoad(t *testing.T) {
+	h := &Hostlist{}
+	h.Update(ParseResult{
+		Blocked:    []string{"ads.example.com."},
+		SkipUpdate: true,
+	})
+
+	rules := h.currentRules()
+	if !rules.domainTrie.Lookup("ads.example.com.") {
+		t.Fatal("expected initial load even when result is marked SkipUpdate")
+	}
+}
+
+func TestUpdatePublishesCompleteSnapshot(t *testing.T) {
+	h := &Hostlist{}
+	h.Update(ParseResult{Blocked: []string{"old.example.com."}})
+	oldRules := h.currentRules()
+
+	h.Update(ParseResult{Blocked: []string{"new.example.com."}})
+	newRules := h.currentRules()
+
+	if oldRules == newRules {
+		t.Fatal("expected a new immutable snapshot")
+	}
+	if !oldRules.domainTrie.Lookup("old.example.com.") {
+		t.Fatal("expected old snapshot to remain readable")
+	}
+	if !newRules.domainTrie.Lookup("new.example.com.") {
+		t.Fatal("expected new snapshot to contain updated rules")
 	}
 }

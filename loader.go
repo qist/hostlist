@@ -211,6 +211,7 @@ func (l *Loader) LoadAll() ParseResult {
 		mergeResult(&merged, userResult)
 	}
 
+	deduplicateResult(&merged)
 	return merged
 }
 
@@ -247,6 +248,7 @@ func (l *Loader) LoadFromCache() ParseResult {
 		mergeResult(&merged, userResult)
 	}
 
+	deduplicateResult(&merged)
 	return merged
 }
 
@@ -300,7 +302,9 @@ func (l *Loader) loadFromURL(url string) (ParseResult, error) {
 	if err == nil && statusCode == http.StatusNotModified {
 		log.Debugf("Remote %s not modified (304), using cache", url)
 		if cached != nil {
-			return ParseRules(strings.NewReader(string(cached))), nil
+			result := ParseRules(strings.NewReader(string(cached)))
+			result.SkipUpdate = true
+			return result, nil
 		}
 	}
 	if err == nil && statusCode == http.StatusOK {
@@ -455,6 +459,35 @@ func mergeResult(dst *ParseResult, src ParseResult) {
 	dst.SkipUpdate = dst.SkipUpdate && src.SkipUpdate
 }
 
+func deduplicateResult(result *ParseResult) {
+	result.Blocked = deduplicateStrings(result.Blocked)
+	result.BlockedExact = deduplicateStrings(result.BlockedExact)
+	result.Allowlist = deduplicateStrings(result.Allowlist)
+	result.RegexBlock = deduplicateStrings(result.RegexBlock)
+	result.RegexAllow = deduplicateStrings(result.RegexAllow)
+}
+
+func deduplicateStrings(values []string) []string {
+	if len(values) < 2 {
+		return values
+	}
+	seen := make(map[string]struct{}, len(values))
+	n := 0
+	for _, value := range values {
+		if value == "" {
+			continue
+		}
+		if _, ok := seen[value]; ok {
+			continue
+		}
+		seen[value] = struct{}{}
+		values[n] = value
+		n++
+	}
+	clear(values[n:])
+	return values[:n]
+}
+
 type httpError struct {
 	URL        string
 	StatusCode int
@@ -466,9 +499,10 @@ func (e *httpError) Error() string {
 
 // multiLineReader creates an io.Reader from a slice of lines.
 func multiLineReader(lines []string) io.Reader {
-	s := ""
+	var b strings.Builder
 	for _, l := range lines {
-		s += l + "\n"
+		b.WriteString(l)
+		b.WriteByte('\n')
 	}
-	return strings.NewReader(s)
+	return strings.NewReader(b.String())
 }
