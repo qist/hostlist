@@ -179,6 +179,39 @@ func (h *Hostlist) Update(result ParseResult) {
 		newDomain.Len(), newExact.Len(), newAllow.Len(), len(newBlockRe), len(newAllowRe))
 }
 
+// Cleanup releases all resources held by the Hostlist plugin.
+// This is called during shutdown to ensure proper memory cleanup,
+// especially important during reload operations.
+func (h *Hostlist) Cleanup() {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	log.Infof("Hostlist: cleaning up resources")
+
+	// Clear all large data structures
+	h.domainTrie = nil
+	h.exactTrie = nil
+	h.allowTrie = nil
+	h.blockRegexps = nil
+	h.allowRegexps = nil
+	h.bypassIPs = nil
+
+	// Clear safeSearch if it exists
+	if h.safeSearch != nil {
+		h.safeSearch.cleanup()
+		h.safeSearch = nil
+	}
+
+	// Clear loader
+	h.loader = nil
+
+	// Force GC to reclaim memory
+	runtime.GC()
+	debug.FreeOSMemory()
+
+	log.Infof("Hostlist: cleanup completed")
+}
+
 // isBypassIP checks if the given IP is in the bypass whitelist.
 // It handles IPv6-mapped IPv4 addresses (e.g., ::ffff:172.18.44.255).
 func (h *Hostlist) isBypassIP(ip string) bool {

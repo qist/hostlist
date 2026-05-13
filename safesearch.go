@@ -417,6 +417,17 @@ func (s *SafeSearch) Enabled() bool {
 	return s.enabled
 }
 
+// cleanup releases all resources held by the SafeSearch instance.
+func (s *SafeSearch) cleanup() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.enabled = false
+	s.entries = nil
+	s.resolveCache = nil
+	s.resolveCacheAAAA = nil
+}
+
 // buildSafeSearchResponse builds a DNS response for a safe search rewrite.
 // Prefers A/AAAA records (resolved from CNAME targets) over CNAME responses.
 func buildSafeSearchResponse(r *dns.Msg, qname string, entry SafeSearchEntry) *dns.Msg {

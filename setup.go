@@ -39,6 +39,7 @@ func setup(c *caddy.Controller) error {
 
 	c.OnShutdown(func() error {
 		close(stopChan)
+		h.Cleanup()
 		return nil
 	})
 
