@@ -172,6 +172,11 @@ func (h *Hostlist) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *dns.Ms
 				qname:          qname,
 				request:        r,
 			}
+			if safeSearchEntry.CNAME != "" {
+				newReq := r.Copy()
+				newReq.Question[0].Name = safeSearchEntry.CNAME
+				return plugin.NextOrFailure(h.Name(), h.Next, ctx, rw, newReq)
+			}
 			return plugin.NextOrFailure(h.Name(), h.Next, ctx, rw, r)
 		}
 		return plugin.NextOrFailure(h.Name(), h.Next, ctx, w, r)
@@ -197,15 +202,19 @@ func (h *Hostlist) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *dns.Ms
 	}
 
 	if !shouldBlock {
-		// If safesearch matched AND the domain is not explicitly allowed, apply SafeSearch rewrite
-		// If the domain is in allowlist, don't apply SafeSearch (let it pass through normally)
 		if safeSearchEntry != nil && !allowed {
-			// Create a response writer wrapper to intercept and rewrite the response
 			rw := &safeSearchResponseWriter{
 				ResponseWriter: w,
 				entry:          safeSearchEntry,
 				qname:          qname,
 				request:        r,
+			}
+			// Modify the request to query the CNAME target instead of the original domain
+			// This ensures downstream returns the correct IP for the safe search target
+			if safeSearchEntry.CNAME != "" {
+				newReq := r.Copy()
+				newReq.Question[0].Name = safeSearchEntry.CNAME
+				return plugin.NextOrFailure(h.Name(), h.Next, ctx, rw, newReq)
 			}
 			return plugin.NextOrFailure(h.Name(), h.Next, ctx, rw, r)
 		}
