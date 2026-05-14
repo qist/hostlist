@@ -230,9 +230,8 @@ func (l *Loader) loadAllWithContext(ctx context.Context) ParseResult {
 			log.Warningf("Failed to load allowlist from %s: %v", sourceName(src), err)
 			continue
 		}
-		merged.Allowlist = append(merged.Allowlist, result.Blocked...)
+		// Only add allowlist rules from allowSources, not blocked rules
 		merged.Allowlist = append(merged.Allowlist, result.Allowlist...)
-		merged.RegexAllow = append(merged.RegexAllow, result.RegexBlock...)
 		merged.RegexAllow = append(merged.RegexAllow, result.RegexAllow...)
 	}
 
@@ -269,9 +268,8 @@ func (l *Loader) LoadFromCache() ParseResult {
 			log.Debugf("No cached allowlist for %s: %v", sourceName(src), err)
 			continue
 		}
-		merged.Allowlist = append(merged.Allowlist, result.Blocked...)
+		// Only add allowlist rules from allowSources, not blocked rules
 		merged.Allowlist = append(merged.Allowlist, result.Allowlist...)
-		merged.RegexAllow = append(merged.RegexAllow, result.RegexBlock...)
 		merged.RegexAllow = append(merged.RegexAllow, result.RegexAllow...)
 	}
 

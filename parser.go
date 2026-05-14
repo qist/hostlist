@@ -68,6 +68,7 @@ func ParseRules(r io.Reader) ParseResult {
 				}
 				domain := extractAdblockDomain(domainPart)
 				if domain != "" {
+					log.Debugf("ParseRules: allowlist rule %q parsed, domain=%q normalized=%q", line, domain, normalizeDomain(domain))
 					result.Allowlist = appendUnique(result.Allowlist, seenAllowlist, normalizeDomain(domain))
 				}
 			}
