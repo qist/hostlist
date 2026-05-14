@@ -188,8 +188,8 @@ func (h *Hostlist) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *dns.Ms
 	blockRegex := MatchAny(name, rules.blockRegexps)
 	allowRegex := MatchAny(name, rules.allowRegexps)
 
-	log.Debugf("hostlist: qname=%q domainBlocked=%v exactBlocked=%v allowed=%v blockRegex=%v allowRegex=%v mode=%q",
-		qname, domainBlocked, exactBlocked, allowed, blockRegex, allowRegex, h.mode)
+	log.Debugf("hostlist: qname=%q name=%q domainBlocked=%v exactBlocked=%v allowed=%v blockRegex=%v allowRegex=%v mode=%q",
+		qname, name, domainBlocked, exactBlocked, allowed, blockRegex, allowRegex, h.mode)
 
 	blocked := domainBlocked || exactBlocked || blockRegex
 	if allowRegex {

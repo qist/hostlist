@@ -207,10 +207,6 @@ func (ct *CompactTrie) Lookup(domain string) bool {
 
 	nodeIdx := ct.rootIdx
 	for _, label := range parts {
-		if ct.nodes[nodeIdx].blocked() {
-			return true
-		}
-
 		childIdx := ct.findChild(nodeIdx, label)
 		if childIdx == -1 {
 			return false
