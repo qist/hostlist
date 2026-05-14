@@ -273,8 +273,8 @@ func (h *Hostlist) Update(result ParseResult) {
 		}
 	}()
 
-	log.Infof("Update called: SkipUpdate=%v, rules.Load()=%v",
-		result.SkipUpdate, h.rules.Load() != nil)
+	// log.Infof("Update called: SkipUpdate=%v, rules.Load()=%v",
+		// result.SkipUpdate, h.rules.Load() != nil)
 
 	if result.SkipUpdate && h.rules.Load() != nil {
 		log.Debugf("Content unchanged, skipping trie rebuild")
@@ -283,22 +283,22 @@ func (h *Hostlist) Update(result ParseResult) {
 
 	// Parse and compile new data first (without holding the lock)
 	// Use CompactTrie for memory optimization (AdGuardHome-style)
-	log.Infof("Building domain trie with %d entries...", len(result.Blocked))
+	// log.Infof("Building domain trie with %d entries...", len(result.Blocked))
 	newDomain := NewCompactTrie()
 	for _, d := range result.Blocked {
 		newDomain.insertNoLock(d) // Use lock-free insert for batch operation
 	}
-	log.Infof("Domain trie built (%d nodes). Building exact trie with %d entries...", newDomain.Len(), len(result.BlockedExact))
+	// log.Infof("Domain trie built (%d nodes). Building exact trie with %d entries...", newDomain.Len(), len(result.BlockedExact))
 	newExact := NewCompactTrie()
 	for _, d := range result.BlockedExact {
 		newExact.insertExactNoLock(d) // Use lock-free insert for batch operation
 	}
-	log.Infof("Exact trie built (%d nodes). Building allow trie with %d entries...", newExact.Len(), len(result.Allowlist))
+	// log.Infof("Exact trie built (%d nodes). Building allow trie with %d entries...", newExact.Len(), len(result.Allowlist))
 	newAllow := NewCompactTrie()
 	for _, d := range result.Allowlist {
 		newAllow.insertNoLock(d) // Use lock-free insert for batch operation
 	}
-	log.Infof("All tries built. Compiling regexps...")
+	// log.Infof("All tries built. Compiling regexps...")
 
 	newBlockRe := CompileRegexps(result.RegexBlock)
 	newAllowRe := CompileRegexps(result.RegexAllow)
@@ -312,7 +312,7 @@ func (h *Hostlist) Update(result ParseResult) {
 		ipMap:        result.IPMap, // Copy the IP mappings
 	}
 
-	log.Infof("Before Store: newRules.exactTrie.Len()=%d", newRules.exactTrie.Len())
+	// log.Infof("Before Store: newRules.exactTrie.Len()=%d", newRules.exactTrie.Len())
 
 	// Clear children maps to save memory (queries will use linear search)
 	// Temporarily disabled due to bug in ClearChildrenMaps
@@ -323,9 +323,9 @@ func (h *Hostlist) Update(result ParseResult) {
 	h.rules.Store(newRules)
 	storedRules := h.rules.Load()
 	if storedRules != nil {
-		if rs, ok := storedRules.(*ruleSet); ok {
-			log.Infof("After Store: exactTrie.Len()=%d", rs.exactTrie.Len())
-		}
+		// if rs, ok := storedRules.(*ruleSet); ok {
+			// log.Infof("After Store: exactTrie.Len()=%d", rs.exactTrie.Len())
+		// }
 	}
 
 	total := newDomain.Len() + newExact.Len()
@@ -341,7 +341,7 @@ func (h *Hostlist) Update(result ParseResult) {
 // This is called during shutdown to ensure proper memory cleanup,
 // especially important during reload operations.
 func (h *Hostlist) Cleanup() {
-	log.Infof("Hostlist: cleaning up resources")
+	// log.Infof("Hostlist: cleaning up resources")
 
 	h.rules.Store(emptyRuleSet())
 	h.bypassIPs = nil
@@ -359,7 +359,7 @@ func (h *Hostlist) Cleanup() {
 	runtime.GC()
 	debug.FreeOSMemory()
 
-	log.Infof("Hostlist: cleanup completed")
+	// log.Infof("Hostlist: cleanup completed")
 }
 
 func (h *Hostlist) currentRules() *ruleSet {

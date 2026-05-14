@@ -241,8 +241,8 @@ func (l *Loader) loadAllWithContext(ctx context.Context) ParseResult {
 	}
 
 	deduplicateResult(&merged)
-	log.Infof("LoadAll completed: SkipUpdate=%v, Blocked=%d, Exact=%d, Allowlist=%d",
-		merged.SkipUpdate, len(merged.Blocked), len(merged.BlockedExact), len(merged.Allowlist))
+	// log.Infof("LoadAll completed: SkipUpdate=%v, Blocked=%d, Exact=%d, Allowlist=%d",
+		// merged.SkipUpdate, len(merged.Blocked), len(merged.BlockedExact), len(merged.Allowlist))
 	return merged
 }
 
