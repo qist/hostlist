@@ -46,16 +46,35 @@ func (w *safeSearchResponseWriter) WriteMsg(m *dns.Msg) error {
 		}
 		rewriteMsg.Answer = []dns.RR{cname}
 
-		// Copy A/AAAA records from downstream response as additional records
-		// These are the resolved IPs for the CNAME target
+		// Copy A/AAAA records from downstream response to both Answer and Additional sections
+		// Adding to Answer section ensures proper resolution by all DNS clients (including ping)
+		// Adding to Additional section is for DNS protocol compliance
 		for _, rr := range m.Answer {
 			switch r := rr.(type) {
 			case *dns.A:
-				r.Hdr.Name = w.entry.CNAME
-				rewriteMsg.Extra = append(rewriteMsg.Extra, r)
+				newA := &dns.A{
+					Hdr: dns.RR_Header{
+						Name:   w.entry.CNAME,
+						Rrtype: dns.TypeA,
+						Class:  dns.ClassINET,
+						Ttl:    r.Hdr.Ttl,
+					},
+					A: r.A,
+				}
+				rewriteMsg.Answer = append(rewriteMsg.Answer, newA)
+				rewriteMsg.Extra = append(rewriteMsg.Extra, newA)
 			case *dns.AAAA:
-				r.Hdr.Name = w.entry.CNAME
-				rewriteMsg.Extra = append(rewriteMsg.Extra, r)
+				newAAAA := &dns.AAAA{
+					Hdr: dns.RR_Header{
+						Name:   w.entry.CNAME,
+						Rrtype: dns.TypeAAAA,
+						Class:  dns.ClassINET,
+						Ttl:    r.Hdr.Ttl,
+					},
+					AAAA: r.AAAA,
+				}
+				rewriteMsg.Answer = append(rewriteMsg.Answer, newAAAA)
+				rewriteMsg.Extra = append(rewriteMsg.Extra, newAAAA)
 			}
 		}
 	} else if w.entry.A != nil {
@@ -274,7 +293,7 @@ func (h *Hostlist) Update(result ParseResult) {
 	}()
 
 	// log.Infof("Update called: SkipUpdate=%v, rules.Load()=%v",
-		// result.SkipUpdate, h.rules.Load() != nil)
+	// result.SkipUpdate, h.rules.Load() != nil)
 
 	if result.SkipUpdate && h.rules.Load() != nil {
 		log.Debugf("Content unchanged, skipping trie rebuild")
@@ -324,7 +343,7 @@ func (h *Hostlist) Update(result ParseResult) {
 	storedRules := h.rules.Load()
 	if storedRules != nil {
 		// if rs, ok := storedRules.(*ruleSet); ok {
-			// log.Infof("After Store: exactTrie.Len()=%d", rs.exactTrie.Len())
+		// log.Infof("After Store: exactTrie.Len()=%d", rs.exactTrie.Len())
 		// }
 	}
 
