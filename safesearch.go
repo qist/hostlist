@@ -4,9 +4,6 @@ import (
 	"net"
 	"strings"
 	"sync"
-	"time"
-
-	"github.com/miekg/dns"
 )
 
 // SafeSearchEntry defines a safe search rewrite rule.
@@ -301,20 +298,11 @@ var safeSearchMap = map[string]SafeSearchEntry{
 	"kiddle.co": {CNAME: "safe.kiddle.co."},
 }
 
-// cachedIP stores a resolved IP with its expiry time.
-type cachedIP struct {
-	ip      net.IP
-	expires time.Time
-}
-
 // SafeSearch handles safe search DNS rewrites.
 type SafeSearch struct {
-	enabled          bool
-	mu               sync.RWMutex
-	entries          map[string]SafeSearchEntry
-	resolveCache     map[string]cachedIP // CNAME target -> resolved A record with TTL
-	resolveCacheAAAA map[string]cachedIP // CNAME target -> resolved AAAA record with TTL
-	cacheTTL         time.Duration       // TTL for cached DNS resolutions
+	enabled bool
+	mu      sync.RWMutex
+	entries map[string]SafeSearchEntry
 }
 
 // NewSafeSearch creates a new SafeSearch handler.
@@ -324,18 +312,13 @@ func NewSafeSearch(enabled bool) *SafeSearch {
 		entries[k] = v
 	}
 	return &SafeSearch{
-		enabled:          enabled,
-		entries:          entries,
-		resolveCache:     make(map[string]cachedIP),
-		resolveCacheAAAA: make(map[string]cachedIP),
-		cacheTTL:         defaultTTL * time.Second,
+		enabled: enabled,
+		entries: entries,
 	}
 }
 
 // Lookup checks if a domain should be rewritten for safe search.
 // Returns the entry and true if matched.
-// For CNAME-only entries, it resolves the CNAME target to A and AAAA records
-// on demand and caches the results with TTL expiry.
 func (s *SafeSearch) Lookup(domain string) (SafeSearchEntry, bool) {
 	if !s.enabled {
 		return SafeSearchEntry{}, false
@@ -344,58 +327,7 @@ func (s *SafeSearch) Lookup(domain string) (SafeSearchEntry, bool) {
 	s.mu.RLock()
 	entry, ok := s.entries[name]
 	s.mu.RUnlock()
-	if !ok {
-		return SafeSearchEntry{}, false
-	}
-
-	// If entry has CNAME but no A/AAAA record, resolve the CNAME target on demand
-	if entry.CNAME != "" && entry.A == nil && entry.AAAA == nil {
-		target := strings.TrimSuffix(entry.CNAME, ".")
-		now := time.Now()
-
-		s.mu.RLock()
-		aCached, aOk := s.resolveCache[target]
-		aaaaCached, aaaaOk := s.resolveCacheAAAA[target]
-		s.mu.RUnlock()
-
-		// Check if cached entries are still valid
-		aValid := aOk && now.Before(aCached.expires)
-		aaaaValid := aaaaOk && now.Before(aaaaCached.expires)
-
-		if !aValid || !aaaaValid {
-			ips, err := net.LookupHost(target)
-			if err == nil {
-				expires := now.Add(s.cacheTTL)
-				for _, raw := range ips {
-					parsed := net.ParseIP(raw)
-					if parsed == nil {
-						continue
-					}
-					if parsed.To4() != nil && !aValid {
-						s.mu.Lock()
-						s.resolveCache[target] = cachedIP{ip: parsed, expires: expires}
-						s.mu.Unlock()
-						aCached = cachedIP{ip: parsed, expires: expires}
-						aValid = true
-					} else if parsed.To16() != nil && parsed.To4() == nil && !aaaaValid {
-						s.mu.Lock()
-						s.resolveCacheAAAA[target] = cachedIP{ip: parsed, expires: expires}
-						s.mu.Unlock()
-						aaaaCached = cachedIP{ip: parsed, expires: expires}
-						aaaaValid = true
-					}
-				}
-			}
-		}
-		if aValid {
-			entry.A = aCached.ip
-		}
-		if aaaaValid {
-			entry.AAAA = aaaaCached.ip
-		}
-	}
-
-	return entry, true
+	return entry, ok
 }
 
 // SetEnabled enables or disables safe search.
@@ -403,10 +335,6 @@ func (s *SafeSearch) Lookup(domain string) (SafeSearchEntry, bool) {
 func (s *SafeSearch) SetEnabled(enabled bool) {
 	s.mu.Lock()
 	s.enabled = enabled
-	if !enabled {
-		s.resolveCache = make(map[string]cachedIP)
-		s.resolveCacheAAAA = make(map[string]cachedIP)
-	}
 	s.mu.Unlock()
 }
 
@@ -424,39 +352,4 @@ func (s *SafeSearch) cleanup() {
 
 	s.enabled = false
 	s.entries = nil
-	s.resolveCache = nil
-	s.resolveCacheAAAA = nil
-}
-
-// buildSafeSearchResponse builds a DNS response for a safe search rewrite.
-// Prefers A/AAAA records (resolved from CNAME targets) over CNAME responses.
-func buildSafeSearchResponse(r *dns.Msg, qname string, entry SafeSearchEntry) *dns.Msg {
-	m := new(dns.Msg)
-	m.SetReply(r)
-	m.Authoritative = true
-	m.Rcode = dns.RcodeSuccess
-
-	qtype := r.Question[0].Qtype
-
-	if entry.A != nil && (qtype == dns.TypeA || qtype == dns.TypeANY) {
-		m.Answer = append(m.Answer, &dns.A{
-			Hdr: dns.RR_Header{Name: qname, Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: defaultTTL},
-			A:   entry.A,
-		})
-	}
-	if entry.AAAA != nil && (qtype == dns.TypeAAAA || qtype == dns.TypeANY) {
-		m.Answer = append(m.Answer, &dns.AAAA{
-			Hdr:  dns.RR_Header{Name: qname, Rrtype: dns.TypeAAAA, Class: dns.ClassINET, Ttl: defaultTTL},
-			AAAA: entry.AAAA,
-		})
-	}
-	if len(m.Answer) == 0 && entry.CNAME != "" {
-		cname := &dns.CNAME{
-			Hdr:    dns.RR_Header{Name: qname, Rrtype: dns.TypeCNAME, Class: dns.ClassINET, Ttl: defaultTTL},
-			Target: entry.CNAME,
-		}
-		m.Answer = append(m.Answer, cname)
-	}
-
-	return m
 }

@@ -10,7 +10,6 @@ import (
 	"github.com/miekg/dns"
 )
 
-// TestAllowlistOverridesSafeSearch verifies that allowlisted domains bypass SafeSearch
 func TestAllowlistOverridesSafeSearch(t *testing.T) {
 	downstreamCalled := false
 
@@ -18,7 +17,6 @@ func TestAllowlistOverridesSafeSearch(t *testing.T) {
 		downstreamCalled = true
 		m := new(dns.Msg)
 		m.SetReply(r)
-		// Return normal A record (not rewritten)
 		m.Answer = []dns.RR{&dns.A{
 			Hdr: dns.RR_Header{Name: r.Question[0].Name, Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 300},
 			A:   []byte{8, 8, 8, 8},
@@ -27,25 +25,20 @@ func TestAllowlistOverridesSafeSearch(t *testing.T) {
 		return m.Rcode, nil
 	})
 
+	allowTrie := NewCompactTrie()
+	allowTrie.Insert("m.youtube.com.")
+
 	h := &Hostlist{
 		Next:       downstreamHandler,
 		Origins:    []string{"."},
 		mode:       "blacklist",
 		blockType:  "nxdomain",
-		domainTrie: NewCompactTrie(),
-		exactTrie:  NewCompactTrie(),
-		allowTrie:  NewCompactTrie(),
 		safeSearch: NewSafeSearch(true),
 	}
-
-	// Add m.youtube.com to allowlist
-	h.allowTrie.Insert("m.youtube.com.")
-
-	// Create a ruleSet with the allowlist
 	h.rules.Store(&ruleSet{
-		domainTrie: h.domainTrie,
-		exactTrie:  h.exactTrie,
-		allowTrie:  h.allowTrie,
+		domainTrie: NewCompactTrie(),
+		exactTrie:  NewCompactTrie(),
+		allowTrie:  allowTrie,
 	})
 
 	req := new(dns.Msg)
@@ -57,12 +50,10 @@ func TestAllowlistOverridesSafeSearch(t *testing.T) {
 		t.Fatalf("expected no error, got: %v", err)
 	}
 
-	// Verify downstream was called
 	if !downstreamCalled {
 		t.Fatal("expected downstream plugin to be called")
 	}
 
-	// Verify response is NOT rewritten (should have A record from downstream)
 	if rec.Msg == nil {
 		t.Fatal("expected response message")
 	}
@@ -71,7 +62,6 @@ func TestAllowlistOverridesSafeSearch(t *testing.T) {
 		t.Fatal("expected answer from downstream")
 	}
 
-	// Should be A record, not CNAME
 	_, ok := rec.Msg.Answer[0].(*dns.A)
 	if !ok {
 		t.Errorf("expected A record from downstream (not SafeSearch CNAME), got %T: %v", rec.Msg.Answer[0], rec.Msg.Answer[0])
@@ -82,7 +72,6 @@ func TestAllowlistOverridesSafeSearch(t *testing.T) {
 	}
 }
 
-// TestSafeSearchAppliedWhenNotAllowlisted verifies SafeSearch works for non-allowlisted domains
 func TestSafeSearchAppliedWhenNotAllowlisted(t *testing.T) {
 	downstreamCalled := false
 
@@ -103,9 +92,6 @@ func TestSafeSearchAppliedWhenNotAllowlisted(t *testing.T) {
 		Origins:    []string{"."},
 		mode:       "blacklist",
 		blockType:  "nxdomain",
-		domainTrie: NewCompactTrie(),
-		exactTrie:  NewCompactTrie(),
-		allowTrie:  NewCompactTrie(), // Empty allowlist
 		safeSearch: NewSafeSearch(true),
 	}
 
@@ -124,7 +110,6 @@ func TestSafeSearchAppliedWhenNotAllowlisted(t *testing.T) {
 		t.Fatal("expected downstream plugin to be called")
 	}
 
-	// Should be rewritten to CNAME
 	cname, ok := rec.Msg.Answer[0].(*dns.CNAME)
 	if !ok {
 		t.Errorf("expected CNAME from SafeSearch, got %T: %v", rec.Msg.Answer[0], rec.Msg.Answer[0])

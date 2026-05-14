@@ -12,31 +12,24 @@ import (
 	"github.com/miekg/dns"
 )
 
-// TestDNSQueryNotBlockedDuringLoad tests that DNS queries are not blocked during rule loading
 func TestDNSQueryNotBlockedDuringLoad(t *testing.T) {
 	h := &Hostlist{
-		Next:       test.NextHandler(dns.RcodeSuccess, nil),
-		Origins:    []string{"."},
-		mode:       "blacklist",
-		blockType:  "nxdomain",
-		domainTrie: NewCompactTrie(),
-		exactTrie:  NewCompactTrie(),
-		allowTrie:  NewCompactTrie(),
+		Next:      test.NextHandler(dns.RcodeSuccess, nil),
+		Origins:   []string{"."},
+		mode:      "blacklist",
+		blockType: "nxdomain",
 	}
 
-	// Initialize with empty rule set
 	h.rules.Store(emptyRuleSet())
 
-	// Start a slow loading process in background
 	go func() {
-		time.Sleep(100 * time.Millisecond) // Simulate slow load
+		time.Sleep(100 * time.Millisecond)
 		h.Update(ParseResult{
 			Blocked:    []string{"blocked.example.com."},
 			SkipUpdate: false,
 		})
 	}()
 
-	// Send multiple DNS queries during loading
 	for i := 0; i < 10; i++ {
 		req := new(dns.Msg)
 		req.SetQuestion("example.com.", dns.TypeA)
@@ -58,19 +51,14 @@ func TestDNSQueryNotBlockedDuringLoad(t *testing.T) {
 	}
 }
 
-// TestConcurrentDNSQueries tests concurrent DNS queries don't block each other
 func TestConcurrentDNSQueries(t *testing.T) {
 	h := &Hostlist{
-		Next:       test.NextHandler(dns.RcodeSuccess, nil),
-		Origins:    []string{"."},
-		mode:       "blacklist",
-		blockType:  "nxdomain",
-		domainTrie: NewCompactTrie(),
-		exactTrie:  NewCompactTrie(),
-		allowTrie:  NewCompactTrie(),
+		Next:      test.NextHandler(dns.RcodeSuccess, nil),
+		Origins:   []string{"."},
+		mode:      "blacklist",
+		blockType: "nxdomain",
 	}
 
-	// Initialize with empty rule set
 	h.rules.Store(emptyRuleSet())
 
 	var wg sync.WaitGroup
@@ -91,7 +79,7 @@ func TestConcurrentDNSQueries(t *testing.T) {
 				return
 			}
 			if rcode != dns.RcodeSuccess {
-				errors <- nil // Not an error, but unexpected
+				errors <- nil
 			}
 		}(i)
 	}
@@ -106,16 +94,12 @@ func TestConcurrentDNSQueries(t *testing.T) {
 	}
 }
 
-// TestEmptyRulesPerformance tests performance with empty rules
 func TestEmptyRulesPerformance(t *testing.T) {
 	h := &Hostlist{
-		Next:       test.NextHandler(dns.RcodeSuccess, nil),
-		Origins:    []string{"."},
-		mode:       "blacklist",
-		blockType:  "nxdomain",
-		domainTrie: NewCompactTrie(),
-		exactTrie:  NewCompactTrie(),
-		allowTrie:  NewCompactTrie(),
+		Next:      test.NextHandler(dns.RcodeSuccess, nil),
+		Origins:   []string{"."},
+		mode:      "blacklist",
+		blockType: "nxdomain",
 	}
 
 	h.rules.Store(emptyRuleSet())

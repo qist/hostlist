@@ -239,27 +239,6 @@ func hasBadfilter(line string) bool {
 	return false
 }
 
-// parseHostsLine parses a hosts-format line and returns the domains.
-// "127.0.0.1 example.com example.org" -> ["example.com.", "example.org."]
-func parseHostsLine(line string) []string {
-	fields := strings.Fields(line)
-	if len(fields) < 2 {
-		return nil
-	}
-	ip := net.ParseIP(fields[0])
-	if ip == nil {
-		return nil
-	}
-	var domains []string
-	for _, f := range fields[1:] {
-		if f == "" || f[0] == '#' || f[0] == '!' {
-			break
-		}
-		domains = append(domains, normalizeDomain(f))
-	}
-	return domains
-}
-
 // parseHostsLineWithIP parses a hosts-format line and returns domains with IP mapping.
 // Returns (domains, ipString) where ipString is the IP address as a string
 func parseHostsLineWithIP(line string) ([]string, string) {

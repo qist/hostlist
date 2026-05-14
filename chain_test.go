@@ -11,7 +11,6 @@ import (
 	"github.com/miekg/dns"
 )
 
-// TestNextPluginIsCalled verifies that queries are passed to the next plugin
 func TestNextPluginIsCalled(t *testing.T) {
 	nextCalled := false
 	nextHandler := test.HandlerFunc(func(ctx context.Context, w dns.ResponseWriter, r *dns.Msg) (int, error) {
@@ -27,16 +26,12 @@ func TestNextPluginIsCalled(t *testing.T) {
 	})
 
 	h := &Hostlist{
-		Next:       nextHandler,
-		Origins:    []string{"."},
-		mode:       "blacklist",
-		blockType:  "nxdomain",
-		domainTrie: NewCompactTrie(),
-		exactTrie:  NewCompactTrie(),
-		allowTrie:  NewCompactTrie(),
+		Next:      nextHandler,
+		Origins:   []string{"."},
+		mode:      "blacklist",
+		blockType: "nxdomain",
 	}
 
-	// Initialize with empty rule set
 	h.rules.Store(emptyRuleSet())
 
 	req := new(dns.Msg)
@@ -61,7 +56,6 @@ func TestNextPluginIsCalled(t *testing.T) {
 	}
 }
 
-// TestNextPluginNotCalledWhenBlocked verifies blocked queries don't reach next plugin
 func TestNextPluginNotCalledWhenBlocked(t *testing.T) {
 	nextCalled := false
 	nextHandler := test.HandlerFunc(func(ctx context.Context, w dns.ResponseWriter, r *dns.Msg) (int, error) {
@@ -72,22 +66,19 @@ func TestNextPluginNotCalledWhenBlocked(t *testing.T) {
 		return m.Rcode, nil
 	})
 
+	domainTrie := NewCompactTrie()
+	domainTrie.Insert("blocked.example.com.")
+
 	h := &Hostlist{
-		Next:       nextHandler,
-		Origins:    []string{"."},
-		mode:       "blacklist",
-		blockType:  "nxdomain",
-		domainTrie: NewCompactTrie(),
+		Next:      nextHandler,
+		Origins:   []string{"."},
+		mode:      "blacklist",
+		blockType: "nxdomain",
+	}
+	h.rules.Store(&ruleSet{
+		domainTrie: domainTrie,
 		exactTrie:  NewCompactTrie(),
 		allowTrie:  NewCompactTrie(),
-	}
-
-	// Add a blocked domain
-	h.domainTrie.Insert("blocked.example.com.")
-	h.rules.Store(&ruleSet{
-		domainTrie: h.domainTrie,
-		exactTrie:  h.exactTrie,
-		allowTrie:  h.allowTrie,
 	})
 
 	req := new(dns.Msg)
@@ -105,9 +96,7 @@ func TestNextPluginNotCalledWhenBlocked(t *testing.T) {
 	}
 }
 
-// TestChainWithMultiplePlugins simulates the full plugin chain
 func TestChainWithMultiplePlugins(t *testing.T) {
-	// Create a chain: hostlist -> mockSpeedcheck -> mockForward
 	forwardCalled := false
 	mockForward := test.HandlerFunc(func(ctx context.Context, w dns.ResponseWriter, r *dns.Msg) (int, error) {
 		forwardCalled = true
@@ -124,13 +113,10 @@ func TestChainWithMultiplePlugins(t *testing.T) {
 	mockSpeedcheck := plugin.Handler(mockForward)
 
 	h := &Hostlist{
-		Next:       mockSpeedcheck,
-		Origins:    []string{"."},
-		mode:       "blacklist",
-		blockType:  "nxdomain",
-		domainTrie: NewCompactTrie(),
-		exactTrie:  NewCompactTrie(),
-		allowTrie:  NewCompactTrie(),
+		Next:      mockSpeedcheck,
+		Origins:   []string{"."},
+		mode:      "blacklist",
+		blockType: "nxdomain",
 	}
 
 	h.rules.Store(emptyRuleSet())

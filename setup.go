@@ -60,12 +60,9 @@ func setup(c *caddy.Controller) error {
 
 func parse(c *caddy.Controller) (*Hostlist, error) {
 	h := &Hostlist{
-		Origins:    plugin.OriginsFromArgsOrServerBlock(nil, c.ServerBlockKeys),
-		mode:       "blacklist",
-		blockType:  "0.0.0.0",
-		domainTrie: NewCompactTrie(),
-		exactTrie:  NewCompactTrie(),
-		allowTrie:  NewCompactTrie(),
+		Origins:   plugin.OriginsFromArgsOrServerBlock(nil, c.ServerBlockKeys),
+		mode:      "blacklist",
+		blockType: "0.0.0.0",
 	}
 
 	var sources []FilterSource

@@ -11,23 +11,16 @@ import (
 	"github.com/miekg/dns"
 )
 
-// TestIntegrationEmptyRulesDNSWorks tests that DNS queries work even when rules fail to load
 func TestIntegrationEmptyRulesDNSWorks(t *testing.T) {
-	// Create a hostlist with no sources (simulating failed loading)
 	h := &Hostlist{
-		Next:       test.NextHandler(dns.RcodeSuccess, nil),
-		Origins:    []string{"."},
-		mode:       "blacklist",
-		blockType:  "nxdomain",
-		domainTrie: NewCompactTrie(),
-		exactTrie:  NewCompactTrie(),
-		allowTrie:  NewCompactTrie(),
+		Next:      test.NextHandler(dns.RcodeSuccess, nil),
+		Origins:   []string{"."},
+		mode:      "blacklist",
+		blockType: "nxdomain",
 	}
 
-	// Initialize with empty rule set (as done in setup.go)
 	h.rules.Store(emptyRuleSet())
 
-	// Test DNS query should pass through even with no rules
 	req := new(dns.Msg)
 	req.SetQuestion("example.com.", dns.TypeA)
 	rec := dnstest.NewRecorder(&test.ResponseWriter{})
@@ -41,29 +34,22 @@ func TestIntegrationEmptyRulesDNSWorks(t *testing.T) {
 	}
 }
 
-// TestIntegrationUpdateWithEmptyResult tests that updating with empty result doesn't break DNS
 func TestIntegrationUpdateWithEmptyResult(t *testing.T) {
 	h := &Hostlist{
-		Next:       test.NextHandler(dns.RcodeSuccess, nil),
-		Origins:    []string{"."},
-		mode:       "blacklist",
-		blockType:  "nxdomain",
-		domainTrie: NewCompactTrie(),
-		exactTrie:  NewCompactTrie(),
-		allowTrie:  NewCompactTrie(),
+		Next:      test.NextHandler(dns.RcodeSuccess, nil),
+		Origins:   []string{"."},
+		mode:      "blacklist",
+		blockType: "nxdomain",
 	}
 
-	// Initialize with empty rule set
 	h.rules.Store(emptyRuleSet())
 
-	// Update with empty result (simulating failed load)
 	h.Update(ParseResult{
 		Blocked:    []string{},
 		Allowlist:  []string{},
-		SkipUpdate: false, // Important: should not skip update
+		SkipUpdate: false,
 	})
 
-	// DNS query should still work
 	req := new(dns.Msg)
 	req.SetQuestion("example.com.", dns.TypeA)
 	rec := dnstest.NewRecorder(&test.ResponseWriter{})
@@ -77,36 +63,28 @@ func TestIntegrationUpdateWithEmptyResult(t *testing.T) {
 	}
 }
 
-// TestIntegrationLoaderFailureDoesNotBlockDNS tests the complete flow
 func TestIntegrationLoaderFailureDoesNotBlockDNS(t *testing.T) {
-	// Create loader with invalid URL that will fail
 	loader := NewLoader(
 		[]FilterSource{{URL: "http://invalid.example.com/rules.txt"}},
 		[]FilterSource{},
 		[]string{},
-		1*time.Hour, // refresh interval
+		1*time.Hour,
 		"",
 	)
 
 	h := &Hostlist{
-		Next:       test.NextHandler(dns.RcodeSuccess, nil),
-		Origins:    []string{"."},
-		mode:       "blacklist",
-		blockType:  "nxdomain",
-		domainTrie: NewCompactTrie(),
-		exactTrie:  NewCompactTrie(),
-		allowTrie:  NewCompactTrie(),
-		loader:     loader,
+		Next:      test.NextHandler(dns.RcodeSuccess, nil),
+		Origins:   []string{"."},
+		mode:      "blacklist",
+		blockType: "nxdomain",
+		loader:    loader,
 	}
 
-	// Initialize with empty rule set (as done in setup.go)
 	h.rules.Store(emptyRuleSet())
 
-	// Simulate async loading (which will fail)
 	result := loader.LoadAll()
 	h.Update(result)
 
-	// DNS query should still work even though loading failed
 	req := new(dns.Msg)
 	req.SetQuestion("example.com.", dns.TypeA)
 	rec := dnstest.NewRecorder(&test.ResponseWriter{})

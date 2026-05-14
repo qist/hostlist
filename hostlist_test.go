@@ -10,17 +10,27 @@ import (
 	"github.com/miekg/dns"
 )
 
-func TestServeDNSBlacklistBlocked(t *testing.T) {
-	h := &Hostlist{
-		Next:       test.NextHandler(dns.RcodeSuccess, nil),
-		Origins:    []string{"."},
-		mode:       "blacklist",
-		blockType:  "nxdomain",
-		domainTrie: NewCompactTrie(),
-		exactTrie:  NewCompactTrie(),
-		allowTrie:  NewCompactTrie(),
+func makeRules(domainTrie, exactTrie, allowTrie *CompactTrie, blockRegexps, allowRegexps []string) *ruleSet {
+	return &ruleSet{
+		domainTrie:   domainTrie,
+		exactTrie:    exactTrie,
+		allowTrie:    allowTrie,
+		blockRegexps: CompileRegexps(blockRegexps),
+		allowRegexps: CompileRegexps(allowRegexps),
 	}
-	h.domainTrie.Insert("ads.example.com.")
+}
+
+func TestServeDNSBlacklistBlocked(t *testing.T) {
+	domainTrie := NewCompactTrie()
+	domainTrie.Insert("ads.example.com.")
+
+	h := &Hostlist{
+		Next:      test.NextHandler(dns.RcodeSuccess, nil),
+		Origins:   []string{"."},
+		mode:      "blacklist",
+		blockType: "nxdomain",
+	}
+	h.rules.Store(makeRules(domainTrie, NewCompactTrie(), NewCompactTrie(), nil, nil))
 
 	req := new(dns.Msg)
 	req.SetQuestion("ads.example.com.", dns.TypeA)
@@ -48,16 +58,16 @@ func TestServeDNSBlacklistBlocked(t *testing.T) {
 }
 
 func TestServeDNSBlacklistAncestorMatch(t *testing.T) {
+	domainTrie := NewCompactTrie()
+	domainTrie.Insert("example.com.")
+
 	h := &Hostlist{
-		Next:       test.NextHandler(dns.RcodeSuccess, nil),
-		Origins:    []string{"."},
-		mode:       "blacklist",
-		blockType:  "nxdomain",
-		domainTrie: NewCompactTrie(),
-		exactTrie:  NewCompactTrie(),
-		allowTrie:  NewCompactTrie(),
+		Next:      test.NextHandler(dns.RcodeSuccess, nil),
+		Origins:   []string{"."},
+		mode:      "blacklist",
+		blockType: "nxdomain",
 	}
-	h.domainTrie.Insert("example.com.")
+	h.rules.Store(makeRules(domainTrie, NewCompactTrie(), NewCompactTrie(), nil, nil))
 
 	req := new(dns.Msg)
 	req.SetQuestion("sub.example.com.", dns.TypeA)
@@ -70,17 +80,18 @@ func TestServeDNSBlacklistAncestorMatch(t *testing.T) {
 }
 
 func TestServeDNSBlacklistAllowed(t *testing.T) {
+	domainTrie := NewCompactTrie()
+	domainTrie.Insert("example.com.")
+	allowTrie := NewCompactTrie()
+	allowTrie.Insert("example.com.")
+
 	h := &Hostlist{
-		Next:       test.NextHandler(dns.RcodeSuccess, nil),
-		Origins:    []string{"."},
-		mode:       "blacklist",
-		blockType:  "nxdomain",
-		domainTrie: NewCompactTrie(),
-		exactTrie:  NewCompactTrie(),
-		allowTrie:  NewCompactTrie(),
+		Next:      test.NextHandler(dns.RcodeSuccess, nil),
+		Origins:   []string{"."},
+		mode:      "blacklist",
+		blockType: "nxdomain",
 	}
-	h.domainTrie.Insert("example.com.")
-	h.allowTrie.Insert("example.com.")
+	h.rules.Store(makeRules(domainTrie, NewCompactTrie(), allowTrie, nil, nil))
 
 	req := new(dns.Msg)
 	req.SetQuestion("example.com.", dns.TypeAAAA)
@@ -93,16 +104,16 @@ func TestServeDNSBlacklistAllowed(t *testing.T) {
 }
 
 func TestServeDNSBlacklistNotBlocked(t *testing.T) {
+	domainTrie := NewCompactTrie()
+	domainTrie.Insert("ads.example.com.")
+
 	h := &Hostlist{
-		Next:       test.NextHandler(dns.RcodeSuccess, nil),
-		Origins:    []string{"."},
-		mode:       "blacklist",
-		blockType:  "nxdomain",
-		domainTrie: NewCompactTrie(),
-		exactTrie:  NewCompactTrie(),
-		allowTrie:  NewCompactTrie(),
+		Next:      test.NextHandler(dns.RcodeSuccess, nil),
+		Origins:   []string{"."},
+		mode:      "blacklist",
+		blockType: "nxdomain",
 	}
-	h.domainTrie.Insert("ads.example.com.")
+	h.rules.Store(makeRules(domainTrie, NewCompactTrie(), NewCompactTrie(), nil, nil))
 
 	req := new(dns.Msg)
 	req.SetQuestion("normal.com.", dns.TypeA)
@@ -115,18 +126,17 @@ func TestServeDNSBlacklistNotBlocked(t *testing.T) {
 }
 
 func TestServeDNSWhitelistMode(t *testing.T) {
-	h := &Hostlist{
-		Next:       test.NextHandler(dns.RcodeSuccess, nil),
-		Origins:    []string{"."},
-		mode:       "whitelist",
-		blockType:  "nxdomain",
-		domainTrie: NewCompactTrie(),
-		exactTrie:  NewCompactTrie(),
-		allowTrie:  NewCompactTrie(),
-	}
-	h.domainTrie.Insert("allowed.com.")
+	domainTrie := NewCompactTrie()
+	domainTrie.Insert("allowed.com.")
 
-	// Allowed domain passes
+	h := &Hostlist{
+		Next:      test.NextHandler(dns.RcodeSuccess, nil),
+		Origins:   []string{"."},
+		mode:      "whitelist",
+		blockType: "nxdomain",
+	}
+	h.rules.Store(makeRules(domainTrie, NewCompactTrie(), NewCompactTrie(), nil, nil))
+
 	req := new(dns.Msg)
 	req.SetQuestion("allowed.com.", dns.TypeA)
 	rec := dnstest.NewRecorder(&test.ResponseWriter{})
@@ -135,7 +145,6 @@ func TestServeDNSWhitelistMode(t *testing.T) {
 		t.Fatalf("expected pass-through for allowed domain, got %d", rcode)
 	}
 
-	// Non-listed domain blocked
 	req.SetQuestion("blocked.com.", dns.TypeA)
 	rec = dnstest.NewRecorder(&test.ResponseWriter{})
 	rcode, _ = h.ServeDNS(context.Background(), rec, req)
@@ -145,16 +154,16 @@ func TestServeDNSWhitelistMode(t *testing.T) {
 }
 
 func TestServeDNSBlockTypeEmpty(t *testing.T) {
+	domainTrie := NewCompactTrie()
+	domainTrie.Insert("ads.example.com.")
+
 	h := &Hostlist{
-		Next:       test.NextHandler(dns.RcodeSuccess, nil),
-		Origins:    []string{"."},
-		mode:       "blacklist",
-		blockType:  "empty",
-		domainTrie: NewCompactTrie(),
-		exactTrie:  NewCompactTrie(),
-		allowTrie:  NewCompactTrie(),
+		Next:      test.NextHandler(dns.RcodeSuccess, nil),
+		Origins:   []string{"."},
+		mode:      "blacklist",
+		blockType: "empty",
 	}
-	h.domainTrie.Insert("ads.example.com.")
+	h.rules.Store(makeRules(domainTrie, NewCompactTrie(), NewCompactTrie(), nil, nil))
 
 	req := new(dns.Msg)
 	req.SetQuestion("ads.example.com.", dns.TypeA)
@@ -173,16 +182,16 @@ func TestServeDNSBlockTypeEmpty(t *testing.T) {
 }
 
 func TestServeDNSAAAA(t *testing.T) {
+	domainTrie := NewCompactTrie()
+	domainTrie.Insert("ads.example.com.")
+
 	h := &Hostlist{
-		Next:       test.NextHandler(dns.RcodeSuccess, nil),
-		Origins:    []string{"."},
-		mode:       "blacklist",
-		blockType:  "nxdomain",
-		domainTrie: NewCompactTrie(),
-		exactTrie:  NewCompactTrie(),
-		allowTrie:  NewCompactTrie(),
+		Next:      test.NextHandler(dns.RcodeSuccess, nil),
+		Origins:   []string{"."},
+		mode:      "blacklist",
+		blockType: "nxdomain",
 	}
-	h.domainTrie.Insert("ads.example.com.")
+	h.rules.Store(makeRules(domainTrie, NewCompactTrie(), NewCompactTrie(), nil, nil))
 
 	req := new(dns.Msg)
 	req.SetQuestion("ads.example.com.", dns.TypeAAAA)
@@ -196,15 +205,12 @@ func TestServeDNSAAAA(t *testing.T) {
 
 func TestServeDNSRegex(t *testing.T) {
 	h := &Hostlist{
-		Next:         test.NextHandler(dns.RcodeSuccess, nil),
-		Origins:      []string{"."},
-		mode:         "blacklist",
-		blockType:    "nxdomain",
-		domainTrie:   NewCompactTrie(),
-		exactTrie:    NewCompactTrie(),
-		allowTrie:    NewCompactTrie(),
-		blockRegexps: CompileRegexps([]string{`^ads\d*\.`}),
+		Next:      test.NextHandler(dns.RcodeSuccess, nil),
+		Origins:   []string{"."},
+		mode:      "blacklist",
+		blockType: "nxdomain",
 	}
+	h.rules.Store(makeRules(NewCompactTrie(), NewCompactTrie(), NewCompactTrie(), []string{`^ads\d*\.`}, nil))
 
 	req := new(dns.Msg)
 	req.SetQuestion("ads1.example.com.", dns.TypeA)
@@ -249,15 +255,11 @@ func TestUpdatePublishesCompleteSnapshot(t *testing.T) {
 }
 
 func TestServeDNSWithEmptyRules(t *testing.T) {
-	// Test that DNS queries work even when no rules are loaded
 	h := &Hostlist{
-		Next:       test.NextHandler(dns.RcodeSuccess, nil),
-		Origins:    []string{"."},
-		mode:       "blacklist",
-		blockType:  "nxdomain",
-		domainTrie: NewCompactTrie(),
-		exactTrie:  NewCompactTrie(),
-		allowTrie:  NewCompactTrie(),
+		Next:      test.NextHandler(dns.RcodeSuccess, nil),
+		Origins:   []string{"."},
+		mode:      "blacklist",
+		blockType: "nxdomain",
 	}
 
 	req := new(dns.Msg)

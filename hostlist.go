@@ -85,13 +85,6 @@ type Hostlist struct {
 
 	rules atomic.Value // stores *ruleSet; published as a complete immutable snapshot
 
-	// Use CompactTrie for better memory efficiency (AdGuardHome-style optimization)
-	domainTrie   *CompactTrie     // ||domain^ rules (ancestor match)
-	exactTrie    *CompactTrie     // hosts format rules (exact match)
-	allowTrie    *CompactTrie     // @@||domain^ rules (ancestor match)
-	blockRegexps []*regexp.Regexp // /REGEX/ compiled patterns
-	allowRegexps []*regexp.Regexp // @@/REGEX/ compiled patterns
-
 	mode       string      // "blacklist" | "whitelist"
 	blockType  string      // "0.0.0.0" | "nxdomain" | "empty"
 	safeSearch *SafeSearch // safe search handler
@@ -136,18 +129,12 @@ func (h *Hostlist) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *dns.Ms
 
 	zone := plugin.Zones(h.Origins).Matches(qname)
 	if zone == "" {
-		if strings.Contains(qname, "33across") || strings.Contains(qname, "youtube") {
-			log.Infof("Zone match failed for %s, passing to next", qname)
-		}
 		return plugin.NextOrFailure(h.Name(), h.Next, ctx, w, r)
 	}
 
 	// Check if client IP is in bypass whitelist
 	// Bypass IPs skip both safe search and parental control blocking
 	if h.isBypassIP(state.IP()) {
-		if strings.Contains(qname, "33across") || strings.Contains(qname, "youtube") {
-			log.Infof("Bypass IP matched for %s from %s, passing to next", qname, state.IP())
-		}
 		return plugin.NextOrFailure(h.Name(), h.Next, ctx, w, r)
 	}
 
@@ -169,10 +156,6 @@ func (h *Hostlist) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *dns.Ms
 	if rules.domainTrie.Len() == 0 && rules.exactTrie.Len() == 0 &&
 		len(rules.blockRegexps) == 0 && len(rules.allowRegexps) == 0 &&
 		rules.allowTrie.Len() == 0 {
-		if strings.Contains(qname, "33across") || strings.Contains(qname, "youtube") {
-			log.Infof("Ultra-fast path for %s (no rules loaded), passing to next", qname)
-		}
-		// If safesearch matched, use wrapper even in fast path
 		if safeSearchEntry != nil {
 			rw := &safeSearchResponseWriter{
 				ResponseWriter: w,
@@ -338,13 +321,7 @@ func (h *Hostlist) Update(result ParseResult) {
 func (h *Hostlist) Cleanup() {
 	log.Infof("Hostlist: cleaning up resources")
 
-	// Clear all large data structures
 	h.rules.Store(emptyRuleSet())
-	h.domainTrie = nil
-	h.exactTrie = nil
-	h.allowTrie = nil
-	h.blockRegexps = nil
-	h.allowRegexps = nil
 	h.bypassIPs = nil
 
 	// Clear safeSearch if it exists
@@ -367,13 +344,7 @@ func (h *Hostlist) currentRules() *ruleSet {
 	if v := h.rules.Load(); v != nil {
 		return v.(*ruleSet)
 	}
-	return &ruleSet{
-		domainTrie:   nonNilTrie(h.domainTrie),
-		exactTrie:    nonNilTrie(h.exactTrie),
-		allowTrie:    nonNilTrie(h.allowTrie),
-		blockRegexps: h.blockRegexps,
-		allowRegexps: h.allowRegexps,
-	}
+	return emptyRuleSet()
 }
 
 func emptyRuleSet() *ruleSet {
@@ -382,13 +353,6 @@ func emptyRuleSet() *ruleSet {
 		exactTrie:  NewCompactTrie(),
 		allowTrie:  NewCompactTrie(),
 	}
-}
-
-func nonNilTrie(t *CompactTrie) *CompactTrie {
-	if t != nil {
-		return t
-	}
-	return NewCompactTrie()
 }
 
 // isBypassIP checks if the given IP is in the bypass whitelist.
