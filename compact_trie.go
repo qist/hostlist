@@ -226,9 +226,91 @@ func (ct *CompactTrie) ClearChildrenMaps() {
 	ct.mu.Lock()
 	defer ct.mu.Unlock()
 
-	for i := range ct.nodes {
-		ct.nodes[i].childrenMap = nil
+	// 首先构建一个映射表，记录每个节点在新数组中的位置
+	nodeMapping := make([]int, len(ct.nodes))
+	for i := range nodeMapping {
+		nodeMapping[i] = i
 	}
+
+	// 遍历所有节点，确保子节点连续存储
+	for parentIdx := range ct.nodes {
+		parent := ct.nodes[parentIdx]
+		if parent.childrenCount == 0 || parent.childrenMap == nil {
+			continue
+		}
+
+		// 获取当前子节点区域的信息
+		currentOffset := int(parent.childrenOffset)
+		currentCount := int(parent.childrenCount)
+
+		// 检查子节点是否已经连续存储
+		isContiguous := true
+		expectedEnd := currentOffset + currentCount
+		if expectedEnd > len(ct.nodes) {
+			isContiguous = false
+		} else {
+			seen := make(map[int]bool)
+			for _, childIdx := range parent.childrenMap {
+				seen[childIdx] = true
+			}
+			for i := currentOffset; i < expectedEnd; i++ {
+				if !seen[i] {
+					isContiguous = false
+					break
+				}
+			}
+		}
+
+		if isContiguous {
+			ct.nodes[parentIdx].childrenMap = nil
+			continue
+		}
+
+		// 需要重新组织子节点，将它们移动到连续的位置
+		// 创建一个临时数组来保存重新组织后的节点
+		newNodes := make([]trieNodeCompact, 0, len(ct.nodes))
+
+		// 添加父节点之前的所有节点
+		for i := 0; i <= parentIdx; i++ {
+			newNodes = append(newNodes, ct.nodes[i])
+		}
+
+		// 添加父节点的子节点（连续存储）
+		newChildOffset := len(newNodes)
+		for _, childIdx := range parent.childrenMap {
+			newNodes = append(newNodes, ct.nodes[childIdx])
+			// 更新映射表
+			nodeMapping[childIdx] = len(newNodes) - 1
+		}
+
+		// 更新父节点的 childrenOffset
+		ct.nodes[parentIdx].childrenOffset = int32(newChildOffset)
+
+		// 添加剩余的节点（排除已经移动的子节点）
+		seen := make(map[int]bool)
+		for _, childIdx := range parent.childrenMap {
+			seen[childIdx] = true
+		}
+		for i := parentIdx + 1; i < len(ct.nodes); i++ {
+			if !seen[i] {
+				newNodes = append(newNodes, ct.nodes[i])
+				nodeMapping[i] = len(newNodes) - 1
+			}
+		}
+
+		// 更新所有受影响的 childrenMap 中的索引
+		for i := 0; i <= parentIdx; i++ {
+			if ct.nodes[i].childrenMap != nil {
+				for label, idx := range ct.nodes[i].childrenMap {
+					ct.nodes[i].childrenMap[label] = nodeMapping[idx]
+				}
+			}
+		}
+
+		ct.nodes = newNodes
+		ct.nodes[parentIdx].childrenMap = nil
+	}
+
 	ct.labelOffsets = nil
 }
 

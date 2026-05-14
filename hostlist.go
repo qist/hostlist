@@ -315,9 +315,10 @@ func (h *Hostlist) Update(result ParseResult) {
 	log.Infof("Before Store: newRules.exactTrie.Len()=%d", newRules.exactTrie.Len())
 
 	// Clear children maps to save memory (queries will use linear search)
-	newDomain.ClearChildrenMaps()
-	newExact.ClearChildrenMaps()
-	newAllow.ClearChildrenMaps()
+	// Temporarily disabled due to bug in ClearChildrenMaps
+	// newDomain.ClearChildrenMaps()
+	// newExact.ClearChildrenMaps()
+	// newAllow.ClearChildrenMaps()
 
 	h.rules.Store(newRules)
 	storedRules := h.rules.Load()
