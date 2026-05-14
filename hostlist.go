@@ -28,14 +28,12 @@ type safeSearchResponseWriter struct {
 }
 
 func (w *safeSearchResponseWriter) WriteMsg(m *dns.Msg) error {
-	// Rewrite the response to use SafeSearch CNAME
 	rewriteMsg := new(dns.Msg)
 	rewriteMsg.SetReply(w.request)
 	rewriteMsg.Authoritative = m.Authoritative
 	rewriteMsg.RecursionAvailable = m.RecursionAvailable
 	rewriteMsg.Rcode = m.Rcode
 
-	// Replace answer section with CNAME to SafeSearch target
 	if w.entry.CNAME != "" {
 		cname := &dns.CNAME{
 			Hdr: dns.RR_Header{
@@ -47,6 +45,19 @@ func (w *safeSearchResponseWriter) WriteMsg(m *dns.Msg) error {
 			Target: w.entry.CNAME,
 		}
 		rewriteMsg.Answer = []dns.RR{cname}
+
+		// Copy A/AAAA records from downstream response as additional records
+		// These are the resolved IPs for the CNAME target
+		for _, rr := range m.Answer {
+			switch r := rr.(type) {
+			case *dns.A:
+				r.Hdr.Name = w.entry.CNAME
+				rewriteMsg.Extra = append(rewriteMsg.Extra, r)
+			case *dns.AAAA:
+				r.Hdr.Name = w.entry.CNAME
+				rewriteMsg.Extra = append(rewriteMsg.Extra, r)
+			}
+		}
 	} else if w.entry.A != nil {
 		a := &dns.A{
 			Hdr: dns.RR_Header{
@@ -71,9 +82,7 @@ func (w *safeSearchResponseWriter) WriteMsg(m *dns.Msg) error {
 		rewriteMsg.Answer = []dns.RR{aaaa}
 	}
 
-	// Copy authority and additional sections
 	rewriteMsg.Ns = m.Ns
-	rewriteMsg.Extra = m.Extra
 
 	return w.ResponseWriter.WriteMsg(rewriteMsg)
 }
