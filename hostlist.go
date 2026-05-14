@@ -201,9 +201,9 @@ func (h *Hostlist) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *dns.Ms
 		return plugin.NextOrFailure(h.Name(), h.Next, ctx, w, r)
 	}
 
-	domainBlocked := rules.domainTrie.Lookup(name)
+	domainBlocked := rules.domainTrie.LookupWithParentCheck(name)
 	exactBlocked := rules.exactTrie.Lookup(name)
-	allowed := rules.allowTrie.Lookup(name)
+	allowed := rules.allowTrie.LookupWithParentCheck(name)
 	blockRegex := MatchAny(name, rules.blockRegexps)
 	allowRegex := MatchAny(name, rules.allowRegexps)
 

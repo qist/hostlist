@@ -212,10 +212,46 @@ func (ct *CompactTrie) Lookup(domain string) bool {
 			return false
 		}
 		nodeIdx = childIdx
+
+		node := ct.nodes[nodeIdx]
+		if node.blocked() || node.exact() {
+			return true
+		}
 	}
 
-	node := ct.nodes[nodeIdx]
-	return node.blocked() || node.exact()
+	return false
+}
+
+func (ct *CompactTrie) LookupWithParentCheck(domain string) bool {
+	ct.mu.RLock()
+	defer ct.mu.RUnlock()
+
+	parts := labels(domain)
+	if len(parts) == 0 {
+		return false
+	}
+
+	nodeIdx := ct.rootIdx
+	for i, label := range parts {
+		childIdx := ct.findChild(nodeIdx, label)
+		if childIdx == -1 {
+			if i > 0 {
+				parentNode := ct.nodes[nodeIdx]
+				if parentNode.blocked() {
+					return true
+				}
+			}
+			return false
+		}
+		nodeIdx = childIdx
+
+		node := ct.nodes[nodeIdx]
+		if node.blocked() || node.exact() {
+			return true
+		}
+	}
+
+	return false
 }
 
 func (ct *CompactTrie) Len() int {
