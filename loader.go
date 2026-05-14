@@ -1,6 +1,7 @@
 package hostlist
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
@@ -42,9 +43,17 @@ func NewLoader(sources, allowSources []FilterSource, userRules []string, interva
 		sources:      sources,
 		allowSources: allowSources,
 		userRules:    userRules,
-		client:       &http.Client{Timeout: 60 * time.Second},
-		interval:     interval,
-		cacheDir:     cacheDir,
+		client: &http.Client{
+			Timeout: 30 * time.Second, // Reduced timeout for faster failure
+			Transport: &http.Transport{
+				MaxIdleConns:          10,
+				IdleConnTimeout:       90 * time.Second,
+				TLSHandshakeTimeout:   10 * time.Second,
+				ExpectContinueTimeout: 1 * time.Second,
+			},
+		},
+		interval: interval,
+		cacheDir: cacheDir,
 	}
 }
 
@@ -181,11 +190,24 @@ func parseLastModifiedFromContent(content string) string {
 // For file sources: read directly from disk.
 // For allowlist sources: all rules (including ||domain^) are treated as allowlist entries.
 func (l *Loader) LoadAll() ParseResult {
+	return l.loadAllWithContext(context.Background())
+}
+
+// loadAllWithContext loads rules with context for timeout control
+func (l *Loader) loadAllWithContext(ctx context.Context) ParseResult {
 	l.ensureCacheDir()
 	var merged ParseResult
-	merged.SkipUpdate = true
+	merged.SkipUpdate = false // Always allow update to ensure DNS queries work
 
 	for _, src := range l.sources {
+		// Check if context is cancelled
+		select {
+		case <-ctx.Done():
+			log.Warningf("LoadAll cancelled, returning partial result")
+			return merged
+		default:
+		}
+
 		result, err := l.loadSource(src)
 		if err != nil {
 			log.Warningf("Failed to load rules from %s: %v", sourceName(src), err)
@@ -195,6 +217,14 @@ func (l *Loader) LoadAll() ParseResult {
 	}
 
 	for _, src := range l.allowSources {
+		// Check if context is cancelled
+		select {
+		case <-ctx.Done():
+			log.Warningf("LoadAll cancelled, returning partial result")
+			return merged
+		default:
+		}
+
 		result, err := l.loadSource(src)
 		if err != nil {
 			log.Warningf("Failed to load allowlist from %s: %v", sourceName(src), err)
@@ -212,6 +242,8 @@ func (l *Loader) LoadAll() ParseResult {
 	}
 
 	deduplicateResult(&merged)
+	log.Infof("LoadAll completed: SkipUpdate=%v, Blocked=%d, Exact=%d, Allowlist=%d",
+		merged.SkipUpdate, len(merged.Blocked), len(merged.BlockedExact), len(merged.Allowlist))
 	return merged
 }
 
@@ -220,7 +252,7 @@ func (l *Loader) LoadAll() ParseResult {
 func (l *Loader) LoadFromCache() ParseResult {
 	l.ensureCacheDir()
 	var merged ParseResult
-	merged.SkipUpdate = true
+	merged.SkipUpdate = false // Always allow update to ensure DNS queries work
 
 	for _, src := range l.sources {
 		result, err := l.loadFromCacheOnly(src)
@@ -457,6 +489,15 @@ func mergeResult(dst *ParseResult, src ParseResult) {
 	dst.RegexBlock = append(dst.RegexBlock, src.RegexBlock...)
 	dst.RegexAllow = append(dst.RegexAllow, src.RegexAllow...)
 	dst.SkipUpdate = dst.SkipUpdate && src.SkipUpdate
+	// Merge IPMap
+	if src.IPMap != nil {
+		if dst.IPMap == nil {
+			dst.IPMap = make(map[string]string)
+		}
+		for k, v := range src.IPMap {
+			dst.IPMap[k] = v
+		}
+	}
 }
 
 func deduplicateResult(result *ParseResult) {

@@ -16,9 +16,9 @@ func TestServeDNSBlacklistBlocked(t *testing.T) {
 		Origins:    []string{"."},
 		mode:       "blacklist",
 		blockType:  "nxdomain",
-		domainTrie: NewTrie(),
-		exactTrie:  NewTrie(),
-		allowTrie:  NewTrie(),
+		domainTrie: NewCompactTrie(),
+		exactTrie:  NewCompactTrie(),
+		allowTrie:  NewCompactTrie(),
 	}
 	h.domainTrie.Insert("ads.example.com.")
 
@@ -53,9 +53,9 @@ func TestServeDNSBlacklistAncestorMatch(t *testing.T) {
 		Origins:    []string{"."},
 		mode:       "blacklist",
 		blockType:  "nxdomain",
-		domainTrie: NewTrie(),
-		exactTrie:  NewTrie(),
-		allowTrie:  NewTrie(),
+		domainTrie: NewCompactTrie(),
+		exactTrie:  NewCompactTrie(),
+		allowTrie:  NewCompactTrie(),
 	}
 	h.domainTrie.Insert("example.com.")
 
@@ -75,9 +75,9 @@ func TestServeDNSBlacklistAllowed(t *testing.T) {
 		Origins:    []string{"."},
 		mode:       "blacklist",
 		blockType:  "nxdomain",
-		domainTrie: NewTrie(),
-		exactTrie:  NewTrie(),
-		allowTrie:  NewTrie(),
+		domainTrie: NewCompactTrie(),
+		exactTrie:  NewCompactTrie(),
+		allowTrie:  NewCompactTrie(),
 	}
 	h.domainTrie.Insert("example.com.")
 	h.allowTrie.Insert("example.com.")
@@ -98,9 +98,9 @@ func TestServeDNSBlacklistNotBlocked(t *testing.T) {
 		Origins:    []string{"."},
 		mode:       "blacklist",
 		blockType:  "nxdomain",
-		domainTrie: NewTrie(),
-		exactTrie:  NewTrie(),
-		allowTrie:  NewTrie(),
+		domainTrie: NewCompactTrie(),
+		exactTrie:  NewCompactTrie(),
+		allowTrie:  NewCompactTrie(),
 	}
 	h.domainTrie.Insert("ads.example.com.")
 
@@ -120,9 +120,9 @@ func TestServeDNSWhitelistMode(t *testing.T) {
 		Origins:    []string{"."},
 		mode:       "whitelist",
 		blockType:  "nxdomain",
-		domainTrie: NewTrie(),
-		exactTrie:  NewTrie(),
-		allowTrie:  NewTrie(),
+		domainTrie: NewCompactTrie(),
+		exactTrie:  NewCompactTrie(),
+		allowTrie:  NewCompactTrie(),
 	}
 	h.domainTrie.Insert("allowed.com.")
 
@@ -150,9 +150,9 @@ func TestServeDNSBlockTypeEmpty(t *testing.T) {
 		Origins:    []string{"."},
 		mode:       "blacklist",
 		blockType:  "empty",
-		domainTrie: NewTrie(),
-		exactTrie:  NewTrie(),
-		allowTrie:  NewTrie(),
+		domainTrie: NewCompactTrie(),
+		exactTrie:  NewCompactTrie(),
+		allowTrie:  NewCompactTrie(),
 	}
 	h.domainTrie.Insert("ads.example.com.")
 
@@ -178,9 +178,9 @@ func TestServeDNSAAAA(t *testing.T) {
 		Origins:    []string{"."},
 		mode:       "blacklist",
 		blockType:  "nxdomain",
-		domainTrie: NewTrie(),
-		exactTrie:  NewTrie(),
-		allowTrie:  NewTrie(),
+		domainTrie: NewCompactTrie(),
+		exactTrie:  NewCompactTrie(),
+		allowTrie:  NewCompactTrie(),
 	}
 	h.domainTrie.Insert("ads.example.com.")
 
@@ -200,9 +200,9 @@ func TestServeDNSRegex(t *testing.T) {
 		Origins:      []string{"."},
 		mode:         "blacklist",
 		blockType:    "nxdomain",
-		domainTrie:   NewTrie(),
-		exactTrie:    NewTrie(),
-		allowTrie:    NewTrie(),
+		domainTrie:   NewCompactTrie(),
+		exactTrie:    NewCompactTrie(),
+		allowTrie:    NewCompactTrie(),
 		blockRegexps: CompileRegexps([]string{`^ads\d*\.`}),
 	}
 
@@ -245,5 +245,27 @@ func TestUpdatePublishesCompleteSnapshot(t *testing.T) {
 	}
 	if !newRules.domainTrie.Lookup("new.example.com.") {
 		t.Fatal("expected new snapshot to contain updated rules")
+	}
+}
+
+func TestServeDNSWithEmptyRules(t *testing.T) {
+	// Test that DNS queries work even when no rules are loaded
+	h := &Hostlist{
+		Next:       test.NextHandler(dns.RcodeSuccess, nil),
+		Origins:    []string{"."},
+		mode:       "blacklist",
+		blockType:  "nxdomain",
+		domainTrie: NewCompactTrie(),
+		exactTrie:  NewCompactTrie(),
+		allowTrie:  NewCompactTrie(),
+	}
+
+	req := new(dns.Msg)
+	req.SetQuestion("example.com.", dns.TypeA)
+	rec := dnstest.NewRecorder(&test.ResponseWriter{})
+
+	rcode, _ := h.ServeDNS(context.Background(), rec, req)
+	if rcode != dns.RcodeSuccess {
+		t.Fatalf("expected pass-through with empty rules, got rcode %d", rcode)
 	}
 }

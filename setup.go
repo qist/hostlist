@@ -22,11 +22,18 @@ func setup(c *caddy.Controller) error {
 		return plugin.Error(pluginName, err)
 	}
 
+	// Initialize with empty rule set immediately during parsing
+	// This ensures DNS queries work even before startup completes
+	h.rules.Store(emptyRuleSet())
+
 	c.OnStartup(func() error {
 		// Start async refresh immediately (no cache trie to avoid double memory)
 		go func() {
+			log.Infof("Starting LoadAll in goroutine")
 			result := h.loader.LoadAll()
+			log.Infof("LoadAll returned, calling Update with SkipUpdate=%v", result.SkipUpdate)
 			h.Update(result)
+			log.Infof("Update completed")
 		}()
 
 		return nil
@@ -56,9 +63,9 @@ func parse(c *caddy.Controller) (*Hostlist, error) {
 		Origins:    plugin.OriginsFromArgsOrServerBlock(nil, c.ServerBlockKeys),
 		mode:       "blacklist",
 		blockType:  "0.0.0.0",
-		domainTrie: NewTrie(),
-		exactTrie:  NewTrie(),
-		allowTrie:  NewTrie(),
+		domainTrie: NewCompactTrie(),
+		exactTrie:  NewCompactTrie(),
+		allowTrie:  NewCompactTrie(),
 	}
 
 	var sources []FilterSource

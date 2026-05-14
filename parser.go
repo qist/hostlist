@@ -12,12 +12,13 @@ import (
 
 // ParseResult holds the parsed domains and regex patterns from rule files.
 type ParseResult struct {
-	Blocked      []string // ||domain^ rules (ancestor match)
-	BlockedExact []string // IP domain rules (exact match, hosts format)
-	Allowlist    []string // @@||domain^ rules
-	RegexBlock   []string // /REGEX/ patterns
-	RegexAllow   []string // @@/REGEX/ patterns
-	SkipUpdate   bool     // true if content unchanged, caller should skip trie rebuild
+	Blocked      []string          // ||domain^ rules (ancestor match)
+	BlockedExact []string          // IP domain rules (exact match, hosts format)
+	Allowlist    []string          // @@||domain^ rules
+	RegexBlock   []string          // /REGEX/ patterns
+	RegexAllow   []string          // @@/REGEX/ patterns
+	SkipUpdate   bool              // true if content unchanged, caller should skip trie rebuild
+	IPMap        map[string]string // domain -> IP mapping for hosts format rules
 }
 
 // ParseRules reads AdGuard-format rules from r and extracts domains.
@@ -121,9 +122,15 @@ func ParseRules(r io.Reader) ParseResult {
 		}
 
 		// Hosts format: 127.0.0.1 domain or 0.0.0.0 domain
-		if hostsDomains := parseHostsLine(line); len(hostsDomains) > 0 {
+		if hostsDomains, ipStr := parseHostsLineWithIP(line); len(hostsDomains) > 0 {
+			// Initialize IPMap if needed
+			if result.IPMap == nil {
+				result.IPMap = make(map[string]string)
+			}
 			for _, domain := range hostsDomains {
 				result.BlockedExact = appendUnique(result.BlockedExact, seenBlockedExact, domain)
+				// Store the IP mapping for this domain
+				result.IPMap[domain] = ipStr
 			}
 			continue
 		}
@@ -167,9 +174,8 @@ func extractAdblockDomain(s string) string {
 	if domain == "" {
 		return ""
 	}
-	if !strings.Contains(domain, ".") {
-		return ""
-	}
+	// Allow top-level domains (e.g., "top", "cf") for allowlist rules
+	// Previously required at least one dot, but now we support TLDs
 	return domain
 }
 
@@ -252,6 +258,28 @@ func parseHostsLine(line string) []string {
 		domains = append(domains, normalizeDomain(f))
 	}
 	return domains
+}
+
+// parseHostsLineWithIP parses a hosts-format line and returns domains with IP mapping.
+// Returns (domains, ipString) where ipString is the IP address as a string
+func parseHostsLineWithIP(line string) ([]string, string) {
+	fields := strings.Fields(line)
+	if len(fields) < 2 {
+		return nil, ""
+	}
+	ip := net.ParseIP(fields[0])
+	if ip == nil {
+		return nil, ""
+	}
+	ipStr := fields[0]
+	var domains []string
+	for _, f := range fields[1:] {
+		if f == "" || f[0] == '#' || f[0] == '!' {
+			break
+		}
+		domains = append(domains, normalizeDomain(f))
+	}
+	return domains, ipStr
 }
 
 // normalizeDomain lowercases and ensures FQDN.

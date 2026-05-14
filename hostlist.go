@@ -19,6 +19,65 @@ import (
 const pluginName = "hostlist"
 const defaultTTL = 600
 
+// safeSearchResponseWriter wraps a ResponseWriter to rewrite responses with SafeSearch CNAME
+type safeSearchResponseWriter struct {
+	dns.ResponseWriter
+	entry   *SafeSearchEntry
+	qname   string
+	request *dns.Msg // Store the original request
+}
+
+func (w *safeSearchResponseWriter) WriteMsg(m *dns.Msg) error {
+	// Rewrite the response to use SafeSearch CNAME
+	rewriteMsg := new(dns.Msg)
+	rewriteMsg.SetReply(w.request)
+	rewriteMsg.Authoritative = m.Authoritative
+	rewriteMsg.RecursionAvailable = m.RecursionAvailable
+	rewriteMsg.Rcode = m.Rcode
+
+	// Replace answer section with CNAME to SafeSearch target
+	if w.entry.CNAME != "" {
+		cname := &dns.CNAME{
+			Hdr: dns.RR_Header{
+				Name:   w.qname,
+				Rrtype: dns.TypeCNAME,
+				Class:  dns.ClassINET,
+				Ttl:    defaultTTL,
+			},
+			Target: w.entry.CNAME,
+		}
+		rewriteMsg.Answer = []dns.RR{cname}
+	} else if w.entry.A != nil {
+		a := &dns.A{
+			Hdr: dns.RR_Header{
+				Name:   w.qname,
+				Rrtype: dns.TypeA,
+				Class:  dns.ClassINET,
+				Ttl:    defaultTTL,
+			},
+			A: w.entry.A,
+		}
+		rewriteMsg.Answer = []dns.RR{a}
+	} else if w.entry.AAAA != nil {
+		aaaa := &dns.AAAA{
+			Hdr: dns.RR_Header{
+				Name:   w.qname,
+				Rrtype: dns.TypeAAAA,
+				Class:  dns.ClassINET,
+				Ttl:    defaultTTL,
+			},
+			AAAA: w.entry.AAAA,
+		}
+		rewriteMsg.Answer = []dns.RR{aaaa}
+	}
+
+	// Copy authority and additional sections
+	rewriteMsg.Ns = m.Ns
+	rewriteMsg.Extra = m.Extra
+
+	return w.ResponseWriter.WriteMsg(rewriteMsg)
+}
+
 // Hostlist is a plugin that blocks DNS queries based on AdGuard-format rules.
 type Hostlist struct {
 	Next    plugin.Handler
@@ -26,9 +85,10 @@ type Hostlist struct {
 
 	rules atomic.Value // stores *ruleSet; published as a complete immutable snapshot
 
-	domainTrie   *Trie            // ||domain^ rules (ancestor match)
-	exactTrie    *Trie            // hosts format rules (exact match)
-	allowTrie    *Trie            // @@||domain^ rules (ancestor match)
+	// Use CompactTrie for better memory efficiency (AdGuardHome-style optimization)
+	domainTrie   *CompactTrie     // ||domain^ rules (ancestor match)
+	exactTrie    *CompactTrie     // hosts format rules (exact match)
+	allowTrie    *CompactTrie     // @@||domain^ rules (ancestor match)
 	blockRegexps []*regexp.Regexp // /REGEX/ compiled patterns
 	allowRegexps []*regexp.Regexp // @@/REGEX/ compiled patterns
 
@@ -41,11 +101,12 @@ type Hostlist struct {
 }
 
 type ruleSet struct {
-	domainTrie   *Trie
-	exactTrie    *Trie
-	allowTrie    *Trie
+	domainTrie   *CompactTrie
+	exactTrie    *CompactTrie
+	allowTrie    *CompactTrie
 	blockRegexps []*regexp.Regexp
 	allowRegexps []*regexp.Regexp
+	ipMap        map[string]string // domain -> IP mapping for hosts format rules
 }
 
 func (h *Hostlist) Name() string { return pluginName }
@@ -75,27 +136,55 @@ func (h *Hostlist) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *dns.Ms
 
 	zone := plugin.Zones(h.Origins).Matches(qname)
 	if zone == "" {
+		if strings.Contains(qname, "33across") || strings.Contains(qname, "youtube") {
+			log.Infof("Zone match failed for %s, passing to next", qname)
+		}
 		return plugin.NextOrFailure(h.Name(), h.Next, ctx, w, r)
 	}
 
 	// Check if client IP is in bypass whitelist
 	// Bypass IPs skip both safe search and parental control blocking
 	if h.isBypassIP(state.IP()) {
+		if strings.Contains(qname, "33across") || strings.Contains(qname, "youtube") {
+			log.Infof("Bypass IP matched for %s from %s, passing to next", qname, state.IP())
+		}
 		return plugin.NextOrFailure(h.Name(), h.Next, ctx, w, r)
 	}
 
-	// Safe search check (before blocklist, takes priority)
+	// Check safesearch match but don't respond immediately
+	// We'll apply the rewrite after downstream plugins resolve the query
+	var safeSearchEntry *SafeSearchEntry
 	if h.safeSearch != nil && h.safeSearch.Enabled() {
 		if entry, ok := h.safeSearch.Lookup(qname); ok {
-			m := buildSafeSearchResponse(r, qname, entry)
-			w.WriteMsg(m)
-			return m.Rcode, nil
+			safeSearchEntry = &entry
 		}
 	}
 
 	name := strings.ToLower(qname)
 
 	rules := h.currentRules()
+
+	// Ultra-fast path: if no rules loaded at all, immediately pass to next
+	// This avoids any trie lookups or regex matching when rules haven't loaded yet
+	if rules.domainTrie.Len() == 0 && rules.exactTrie.Len() == 0 &&
+		len(rules.blockRegexps) == 0 && len(rules.allowRegexps) == 0 &&
+		rules.allowTrie.Len() == 0 {
+		if strings.Contains(qname, "33across") || strings.Contains(qname, "youtube") {
+			log.Infof("Ultra-fast path for %s (no rules loaded), passing to next", qname)
+		}
+		// If safesearch matched, use wrapper even in fast path
+		if safeSearchEntry != nil {
+			rw := &safeSearchResponseWriter{
+				ResponseWriter: w,
+				entry:          safeSearchEntry,
+				qname:          qname,
+				request:        r,
+			}
+			return plugin.NextOrFailure(h.Name(), h.Next, ctx, rw, r)
+		}
+		return plugin.NextOrFailure(h.Name(), h.Next, ctx, w, r)
+	}
+
 	domainBlocked := rules.domainTrie.Lookup(name)
 	exactBlocked := rules.exactTrie.Lookup(name)
 	allowed := rules.allowTrie.Lookup(name)
@@ -116,6 +205,18 @@ func (h *Hostlist) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *dns.Ms
 	}
 
 	if !shouldBlock {
+		// If safesearch matched AND the domain is not explicitly allowed, apply SafeSearch rewrite
+		// If the domain is in allowlist, don't apply SafeSearch (let it pass through normally)
+		if safeSearchEntry != nil && !allowed {
+			// Create a response writer wrapper to intercept and rewrite the response
+			rw := &safeSearchResponseWriter{
+				ResponseWriter: w,
+				entry:          safeSearchEntry,
+				qname:          qname,
+				request:        r,
+			}
+			return plugin.NextOrFailure(h.Name(), h.Next, ctx, rw, r)
+		}
 		return plugin.NextOrFailure(h.Name(), h.Next, ctx, w, r)
 	}
 
@@ -134,9 +235,22 @@ func (h *Hostlist) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *dns.Ms
 		m.Rcode = dns.RcodeSuccess
 	default: // "0.0.0.0" or any value
 		m.Rcode = dns.RcodeSuccess
+		// Check if we have a specific IP for this domain from hosts format rules
+		blockIP := h.blockType
+		if rules.ipMap != nil {
+			if ip, ok := rules.ipMap[name]; ok {
+				blockIP = ip
+			}
+		}
+		// Parse the IP address
+		ipAddr := net.ParseIP(blockIP)
+		if ipAddr == nil {
+			// Fallback to 0.0.0.0 if parsing fails
+			ipAddr = net.IPv4zero
+		}
 		m.Answer = []dns.RR{&dns.A{
 			Hdr: dns.RR_Header{Name: qname, Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: defaultTTL},
-			A:   net.IPv4zero,
+			A:   ipAddr.To4(),
 		}}
 	}
 
@@ -149,24 +263,38 @@ func (h *Hostlist) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *dns.Ms
 // A new immutable snapshot is built off to the side and published in one store,
 // so queries never observe nil or partially rebuilt rules.
 func (h *Hostlist) Update(result ParseResult) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Errorf("Panic in Update: %v", r)
+		}
+	}()
+
+	log.Infof("Update called: SkipUpdate=%v, rules.Load()=%v",
+		result.SkipUpdate, h.rules.Load() != nil)
+
 	if result.SkipUpdate && h.rules.Load() != nil {
 		log.Debugf("Content unchanged, skipping trie rebuild")
 		return
 	}
 
 	// Parse and compile new data first (without holding the lock)
-	newDomain := NewTrie()
+	// Use CompactTrie for memory optimization (AdGuardHome-style)
+	log.Infof("Building domain trie with %d entries...", len(result.Blocked))
+	newDomain := NewCompactTrie()
 	for _, d := range result.Blocked {
-		newDomain.Insert(d)
+		newDomain.insertNoLock(d) // Use lock-free insert for batch operation
 	}
-	newExact := NewTrie()
+	log.Infof("Domain trie built (%d nodes). Building exact trie with %d entries...", newDomain.Len(), len(result.BlockedExact))
+	newExact := NewCompactTrie()
 	for _, d := range result.BlockedExact {
-		newExact.InsertExact(d)
+		newExact.insertExactNoLock(d) // Use lock-free insert for batch operation
 	}
-	newAllow := NewTrie()
+	log.Infof("Exact trie built (%d nodes). Building allow trie with %d entries...", newExact.Len(), len(result.Allowlist))
+	newAllow := NewCompactTrie()
 	for _, d := range result.Allowlist {
-		newAllow.Insert(d)
+		newAllow.insertNoLock(d) // Use lock-free insert for batch operation
 	}
+	log.Infof("All tries built. Compiling regexps...")
 
 	newBlockRe := CompileRegexps(result.RegexBlock)
 	newAllowRe := CompileRegexps(result.RegexAllow)
@@ -177,13 +305,31 @@ func (h *Hostlist) Update(result ParseResult) {
 		allowTrie:    newAllow,
 		blockRegexps: newBlockRe,
 		allowRegexps: newAllowRe,
+		ipMap:        result.IPMap, // Copy the IP mappings
 	}
+
+	log.Infof("Before Store: newRules.exactTrie.Len()=%d", newRules.exactTrie.Len())
+
+	// Clear children maps to save memory (queries will use linear search)
+	newDomain.ClearChildrenMaps()
+	newExact.ClearChildrenMaps()
+	newAllow.ClearChildrenMaps()
+
 	h.rules.Store(newRules)
+	storedRules := h.rules.Load()
+	if storedRules != nil {
+		if rs, ok := storedRules.(*ruleSet); ok {
+			log.Infof("After Store: exactTrie.Len()=%d", rs.exactTrie.Len())
+		}
+	}
 
 	total := newDomain.Len() + newExact.Len()
 	DomainsLoaded.Set(float64(total))
 	log.Infof("Updated hostlist: %d blocked domains, %d exact, %d allowlist, %d block regexps, %d allow regexps",
 		newDomain.Len(), newExact.Len(), newAllow.Len(), len(newBlockRe), len(newAllowRe))
+
+	// Force garbage collection to release unused memory
+	runtime.GC()
 }
 
 // Cleanup releases all resources held by the Hostlist plugin.
@@ -232,17 +378,17 @@ func (h *Hostlist) currentRules() *ruleSet {
 
 func emptyRuleSet() *ruleSet {
 	return &ruleSet{
-		domainTrie: NewTrie(),
-		exactTrie:  NewTrie(),
-		allowTrie:  NewTrie(),
+		domainTrie: NewCompactTrie(),
+		exactTrie:  NewCompactTrie(),
+		allowTrie:  NewCompactTrie(),
 	}
 }
 
-func nonNilTrie(t *Trie) *Trie {
+func nonNilTrie(t *CompactTrie) *CompactTrie {
 	if t != nil {
 		return t
 	}
-	return NewTrie()
+	return NewCompactTrie()
 }
 
 // isBypassIP checks if the given IP is in the bypass whitelist.

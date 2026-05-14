@@ -324,3 +324,13 @@ go mod tidy
 ```
 hostlist:github.com/qist/hostlist
 ```
+## 常见问题
+
+### Q: 规则加载失败怎么办？
+A: 插件会使用本地缓存，不会中断 DNS 服务。
+
+### Q: 如何验证规则是否生效？
+A: 使用 `dig @127.0.0.1 example.com` 测试，查看日志输出。
+
+### Q: 内存占用过高？
+A: 设置 `GOGC=50` 环境变量启动 CoreDNS。
