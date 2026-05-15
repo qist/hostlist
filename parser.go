@@ -35,6 +35,42 @@ func ParseRules(r io.Reader) ParseResult {
 		if line == "" {
 			continue
 		}
+
+		// Skip payload: line (clash-rules format)
+		if line == "payload:" {
+			continue
+		}
+
+		// Handle clash-rules format: - '+.domain.com' or - ".+domain.com"
+		// The '+' prefix means include subdomains, equivalent to .domain.com
+		// Note: lines may have leading whitespace (indentation)
+		if strings.Contains(line, "- ") {
+			// Find the position of "- " (handles indentation)
+			idx := strings.Index(line, "- ")
+			if idx >= 0 {
+				rest := strings.TrimSpace(line[idx+2:])
+				// Strip surrounding quotes
+				if len(rest) >= 2 && ((rest[0] == '\'' && rest[len(rest)-1] == '\'') || (rest[0] == '"' && rest[len(rest)-1] == '"')) {
+					rest = rest[1 : len(rest)-1]
+				}
+				// Handle '+.domain' format - strip '+' prefix
+				if strings.HasPrefix(rest, "+") {
+					rest = rest[1:]
+				}
+				// If it starts with '.', it's a domain rule for subdomains
+				// Strip the leading '.' to convert .domain.com to domain.com
+				// This is equivalent to ||domain.com^ in AdGuard syntax
+				if strings.HasPrefix(rest, ".") {
+					rest = rest[1:]
+				}
+				domain := strings.TrimSpace(rest)
+				if domain != "" {
+					result.Blocked = appendUnique(result.Blocked, seenBlocked, normalizeDomain(domain))
+				}
+				continue
+			}
+		}
+
 		// Strip surrounding quotes (from Corefile quoting)
 		if len(line) >= 2 && ((line[0] == '\'' && line[len(line)-1] == '\'') || (line[0] == '"' && line[len(line)-1] == '"')) {
 			line = line[1 : len(line)-1]
@@ -180,13 +216,9 @@ func extractAdblockDomain(s string) string {
 }
 
 // extractPlainDomain tries to extract a domain from a plain rule (no || prefix).
-// Handles: ".domain^", "domain$modifier", "domain"
+// Handles: ".domain^", "domain$modifier", "domain", ".xx.com" (surge style)
 // Returns empty string if not a valid domain rule.
 func extractPlainDomain(line string) string {
-	// Must contain at least one dot
-	if !strings.Contains(line, ".") {
-		return ""
-	}
 	// Skip lines that look like unknown modifiers or have special chars
 	if strings.ContainsAny(line, "*[]{}()|\\") {
 		return ""
@@ -203,13 +235,16 @@ func extractPlainDomain(line string) string {
 		}
 	}
 	domain = strings.TrimSpace(domain[:end])
-	if domain == "" || !strings.Contains(domain, ".") {
+	if domain == "" {
 		return ""
 	}
 	// Reject if it looks like a modifier value
 	if strings.HasPrefix(domain, "!") || strings.HasPrefix(domain, "#") {
 		return ""
 	}
+	// Allow single TLDs like "top", "cf" when prefixed with "." (surge style)
+	// e.g., ".top" -> "top", ".cf" -> "cf"
+	// Also allow regular domains like "example.com"
 	return domain
 }
 
