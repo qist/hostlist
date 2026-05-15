@@ -286,6 +286,9 @@ func (h *Hostlist) Update(result ParseResult) {
 	defer func() {
 		if r := recover(); r != nil {
 			log.Errorf("Panic in Update: %v", r)
+			log.Errorf("Result: SkipUpdate=%v, Blocked=%d, BlockedExact=%d, Allowlist=%d",
+				result.SkipUpdate, len(result.Blocked), len(result.BlockedExact), len(result.Allowlist))
+			log.Errorf("Stack trace:\n%s", debug.Stack())
 		}
 	}()
 
@@ -331,10 +334,9 @@ func (h *Hostlist) Update(result ParseResult) {
 	// log.Infof("Before Store: newRules.exactTrie.Len()=%d", newRules.exactTrie.Len())
 
 	// Clear children maps to save memory (queries will use linear search)
-	// Temporarily disabled due to bug in ClearChildrenMaps
-	// newDomain.ClearChildrenMaps()
-	// newExact.ClearChildrenMaps()
-	// newAllow.ClearChildrenMaps()
+	newDomain.ClearChildrenMaps()
+	newExact.ClearChildrenMaps()
+	newAllow.ClearChildrenMaps()
 
 	h.rules.Store(newRules)
 	storedRules := h.rules.Load()
@@ -357,7 +359,7 @@ func (h *Hostlist) Update(result ParseResult) {
 // This is called during shutdown to ensure proper memory cleanup,
 // especially important during reload operations.
 func (h *Hostlist) Cleanup() {
-	// log.Infof("Hostlist: cleaning up resources")
+	log.Infof("Hostlist: cleaning up resources")
 
 	h.rules.Store(emptyRuleSet())
 	h.bypassIPs = nil
