@@ -9,6 +9,8 @@
 ## 特性
 
 - 支持 AdGuard 全部 DNS 过滤规则格式
+- 支持 Surge 规则格式（`.domain.com`）
+- 支持 Clash 规则格式（`payload:` 块中的 `'+.domain.com'`）
 - 黑名单模式（封锁匹配域名）和白名单模式（仅放行匹配域名）
 - 远程 URL 和本地文件两种规则来源
 - 定时自动同步远程规则，支持本地缓存
@@ -47,6 +49,22 @@ hostlist {
         url https://adguardteam.github.io/HostlistsRegistry/assets/filter_21.txt
         file /etc/coredns/custom_blocklist.txt
         refresh 12h
+    }
+    forward . 8.8.8.8:53
+}
+```
+
+### 支持 Surge 和 Clash 规则源
+
+```
+. {
+    hostlist {
+        # Surge 格式规则源
+        url https://raw.githubusercontent.com/Loyalsoldier/surge-rules/release/reject.txt
+        # Clash 格式规则源
+        url https://raw.githubusercontent.com/Loyalsoldier/clash-rules/release/reject.txt
+        mode blacklist
+        refresh 4d
     }
     forward . 8.8.8.8:53
 }
@@ -131,6 +149,8 @@ hostlist {
 | `\|\|*wild*domain^` | `\|\|*serror*.wo.com.cn^` | 通配符，自动转正则 |
 | `.domain^` | `.bbelements.com^` | 封锁域名及子域名 |
 | `domain` | `wykop.pl` | 封锁域名 |
+| `.domain.com` | `.cntv.lat` | Surge 格式，封锁域名及所有子域名（等同于 `\|\|cntv.lat^`） |
+| `payload:` 块 | `- '+.0.avmarket.rs'` | Clash 格式，`+.domain` 封锁域名及所有子域名（等同于 `\|\|0.avmarket.rs^`） |
 
 ### 白名单规则
 
@@ -164,13 +184,34 @@ hostlist {
 - 匹配 `@@`/`whitelist_url`/`whitelist_file` 中的白名单规则 → 放行
 - 匹配 `allowlist` 中的用户白名单 → 放行
 - 匹配 `blocklist` 中的用户黑名单 → 拦截
-- 白名单优先级高于黑名单
+- **白名单优先级最高**，即使域名在黑名单中，只要匹配白名单就放行
 - 其他域名 → 放行
 
 ### 白名单模式
 
 - 匹配 `url`/`file` 中的规则 → 放行
+- 匹配 `allowlist` 中的用户白名单 → 放行
 - 其他域名 → 拦截
+
+### 规则格式兼容性
+
+插件自动识别并处理多种规则格式：
+
+| 来源 | 格式示例 | 处理方式 |
+|------|----------|----------|
+| AdGuard | `||example.com^` | 封锁 example.com 及所有子域名 |
+| Surge | `.example.com` | 等同于 `||example.com^` |
+| Clash | `- '+.example.com'` | 等同于 `||example.com^` |
+| Hosts | `127.0.0.1 example.com` | 仅封锁精确域名 example.com |
+
+### 模式与规则源
+
+`mode` 参数决定规则的生效方式：
+
+- **blacklist 模式**：规则列表中的域名被视为黑名单，匹配则拦截
+- **whitelist 模式**：规则列表中的域名被视为白名单，仅放行匹配的域名
+
+此设置适用于所有规则源（AdGuard、Surge、Clash 格式）。
 
 ### 拦截响应
 
