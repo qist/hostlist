@@ -199,10 +199,10 @@ hostlist {
 
 | 来源 | 格式示例 | 处理方式 |
 |------|----------|----------|
-| AdGuard | `||example.com^` | 封锁 example.com 及所有子域名 |
-| Surge | `.example.com` | 等同于 `||example.com^` |
-| Clash | `- '+.example.com'` | 等同于 `||example.com^` |
-| Hosts | `127.0.0.1 example.com` | 仅封锁精确域名 example.com |
+| AdGuard | \|\|example.com^ | 封锁 example.com 及所有子域名 |
+| Surge | .example.com | 等同于 \|\|example.com^ |
+| Clash | - '+.example.com' | 等同于 \|\|example.com^ |
+| Hosts | 127.0.0.1 example.com | 仅封锁精确域名 example.com |
 
 ### 模式与规则源
 
@@ -374,4 +374,41 @@ A: 插件会使用本地缓存，不会中断 DNS 服务。
 A: 使用 `dig @127.0.0.1 example.com` 测试，查看日志输出。
 
 ### Q: 内存占用过高？
-A: 设置 `GOGC=25` 环境变量启动 CoreDNS。
+
+A: 插件使用 CompactTrie 数据结构存储 50 万+ 域名规则，内存占用约 300-500MB。可以通过设置 `GOGC` 环境变量来优化内存占用。
+
+**GOGC 是什么？**
+
+Go 语言的垃圾回收机制默认在堆内存达到上次回收后的 2 倍时触发（`GOGC=100`）。降低这个值会让垃圾回收更频繁，但能保持更低的内存占用。
+
+**推荐设置：**
+
+| GOGC 值 | 内存占用 | CPU 使用 | 适用场景 |
+|---------|---------|---------|---------|
+| `100`（默认） | 最高 | 最低 | 开发测试 |
+| `30` | 中等 | 中等 | 生产环境推荐 |
+| `25` | 较低 | 较高 | 内存紧张环境 |
+| `20` | 最低 | 最高 | 极低内存环境 |
+
+**设置方法：**
+
+```bash
+# 启动时设置
+GOGC=30 ./coredns -conf Corefile
+
+# 或导出环境变量
+export GOGC=30
+./coredns -conf Corefile
+
+# systemd 服务示例
+Environment=GOGC=30
+```
+
+**实际效果：**
+
+- 规则数量 50 万+ 时
+- `GOGC=100`：内存约 500-600MB
+- `GOGC=30`：内存约 300-400MB
+- `GOGC=25`：内存约 250-350MB
+
+**注意：** GOGC 值越低，垃圾回收越频繁，CPU 开销略高。建议在内存充足时使用 `GOGC=30`，在内存紧张时使用 `GOGC=25`。一般不推荐低于 `20`。
