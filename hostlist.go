@@ -204,9 +204,6 @@ func (h *Hostlist) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *dns.Ms
 	blockRegex := MatchAny(name, rules.blockRegexps)
 	allowRegex := MatchAny(name, rules.allowRegexps)
 
-	log.Debugf("hostlist: qname=%q name=%q domainBlocked=%v exactBlocked=%v allowed=%v blockRegex=%v allowRegex=%v mode=%q",
-		qname, name, domainBlocked, exactBlocked, allowed, blockRegex, allowRegex, h.mode)
-
 	blocked := domainBlocked || exactBlocked || blockRegex
 	if allowRegex {
 		allowed = true
@@ -359,8 +356,6 @@ func (h *Hostlist) Update(result ParseResult) {
 // This is called during shutdown to ensure proper memory cleanup,
 // especially important during reload operations.
 func (h *Hostlist) Cleanup() {
-	log.Infof("Hostlist: cleaning up resources")
-
 	h.rules.Store(emptyRuleSet())
 	h.bypassIPs = nil
 

@@ -29,11 +29,7 @@ func setup(c *caddy.Controller) error {
 	c.OnStartup(func() error {
 		// Start async refresh immediately (no cache trie to avoid double memory)
 		go func() {
-			log.Infof("Starting LoadAll in goroutine")
-			result := h.loader.LoadAll()
-			log.Infof("LoadAll returned, calling Update with SkipUpdate=%v", result.SkipUpdate)
-			h.Update(result)
-			log.Infof("Update completed")
+			h.Update(h.loader.LoadAll())
 		}()
 
 		return nil
