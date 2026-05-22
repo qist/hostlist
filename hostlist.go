@@ -159,8 +159,8 @@ func (h *Hostlist) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *dns.Ms
 
 	// Check if client IP is in bypass whitelist
 	// Bypass IPs skip both safe search and parental control blocking
-	if h.isBypassIP(state.IP()) {
-		return plugin.NextOrFailure(h.Name(), h.Next, ctx, w, r)
+	if h.isBypassIP(clientIPFromRequest(r, state.IP())) {
+		return plugin.NextOrFailure(h.Name(), h.Next, ctx, w, sanitizedRequestForUpstream(r))
 	}
 
 	// Check safesearch match but don't respond immediately
@@ -191,11 +191,11 @@ func (h *Hostlist) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *dns.Ms
 			if safeSearchEntry.CNAME != "" {
 				newReq := r.Copy()
 				newReq.Question[0].Name = safeSearchEntry.CNAME
-				return plugin.NextOrFailure(h.Name(), h.Next, ctx, rw, newReq)
+				return plugin.NextOrFailure(h.Name(), h.Next, ctx, rw, sanitizedRequestForUpstream(newReq))
 			}
-			return plugin.NextOrFailure(h.Name(), h.Next, ctx, rw, r)
+			return plugin.NextOrFailure(h.Name(), h.Next, ctx, rw, sanitizedRequestForUpstream(r))
 		}
-		return plugin.NextOrFailure(h.Name(), h.Next, ctx, w, r)
+		return plugin.NextOrFailure(h.Name(), h.Next, ctx, w, sanitizedRequestForUpstream(r))
 	}
 
 	domainBlocked := rules.domainTrie.LookupWithParentCheck(name)
@@ -230,11 +230,11 @@ func (h *Hostlist) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *dns.Ms
 			if safeSearchEntry.CNAME != "" {
 				newReq := r.Copy()
 				newReq.Question[0].Name = safeSearchEntry.CNAME
-				return plugin.NextOrFailure(h.Name(), h.Next, ctx, rw, newReq)
+				return plugin.NextOrFailure(h.Name(), h.Next, ctx, rw, sanitizedRequestForUpstream(newReq))
 			}
-			return plugin.NextOrFailure(h.Name(), h.Next, ctx, rw, r)
+			return plugin.NextOrFailure(h.Name(), h.Next, ctx, rw, sanitizedRequestForUpstream(r))
 		}
-		return plugin.NextOrFailure(h.Name(), h.Next, ctx, w, r)
+		return plugin.NextOrFailure(h.Name(), h.Next, ctx, w, sanitizedRequestForUpstream(r))
 	}
 
 	RequestBlockCount.WithLabelValues(metrics.WithServer(ctx), zone).Inc()
@@ -418,4 +418,92 @@ func (h *Hostlist) isBypassIP(ip string) bool {
 		}
 	}
 	return false
+}
+
+// clientIPFromRequest returns the client IP to use for policy checks.
+// Prefer EDNS0 Client Subnet when present, otherwise fall back to the socket peer.
+func clientIPFromRequest(r *dns.Msg, remoteIP string) string {
+	if ecsIP := ecsClientIP(r); ecsIP != "" {
+		return ecsIP
+	}
+	return remoteIP
+}
+
+func ecsClientIP(r *dns.Msg) string {
+	opt := r.IsEdns0()
+	if opt == nil {
+		return ""
+	}
+
+	for _, option := range opt.Option {
+		subnet, ok := option.(*dns.EDNS0_SUBNET)
+		if !ok || subnet.SourceNetmask == 0 || subnet.Address == nil {
+			continue
+		}
+		return subnet.Address.String()
+	}
+
+	return ""
+}
+
+// sanitizedRequestForUpstream removes ECS before forwarding when it contains a private or local address.
+// The original request is left untouched so hostlist can still use ECS for local policy decisions.
+func sanitizedRequestForUpstream(r *dns.Msg) *dns.Msg {
+	if !hasPrivateOrLocalECS(r) {
+		return r
+	}
+
+	req := r.Copy()
+	stripECS(req)
+	return req
+}
+
+func hasPrivateOrLocalECS(r *dns.Msg) bool {
+	opt := r.IsEdns0()
+	if opt == nil {
+		return false
+	}
+
+	for _, option := range opt.Option {
+		subnet, ok := option.(*dns.EDNS0_SUBNET)
+		if !ok || subnet.Address == nil || subnet.SourceNetmask == 0 {
+			continue
+		}
+		if isPrivateOrLocalIP(subnet.Address) {
+			return true
+		}
+	}
+
+	return false
+}
+
+func stripECS(r *dns.Msg) {
+	opt := r.IsEdns0()
+	if opt == nil {
+		return
+	}
+
+	filtered := opt.Option[:0]
+	for _, option := range opt.Option {
+		if _, ok := option.(*dns.EDNS0_SUBNET); ok {
+			continue
+		}
+		filtered = append(filtered, option)
+	}
+	opt.Option = filtered
+}
+
+func isPrivateOrLocalIP(ip net.IP) bool {
+	if ip == nil {
+		return false
+	}
+	if ipv4 := ip.To4(); ipv4 != nil {
+		ip = ipv4
+	}
+
+	return ip.IsPrivate() ||
+		ip.IsLoopback() ||
+		ip.IsLinkLocalUnicast() ||
+		ip.IsLinkLocalMulticast() ||
+		ip.IsUnspecified()
 }

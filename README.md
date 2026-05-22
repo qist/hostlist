@@ -301,6 +301,38 @@ hostlist {
 - 企业内部，管理设备绕过过滤，员工设备正常过滤
 - 支持 IPv4 和 IPv6 地址，支持 CIDR 网段格式
 
+如果 `hostlist` 前面还有一层 DNS 转发器（例如 `dnsmasq`、`OpenWrt dnsmasq`），要让 `bypass_ip` 按真实客户端 IP 生效，需要让前置转发器把客户端地址通过 `EDNS0 Client Subnet (ECS)` 传给 CoreDNS。
+
+当前实现会优先读取请求里的 `ECS` 客户端地址；如果请求里没有 `ECS`，则回退为连接到 CoreDNS 的对端地址（`RemoteAddr`）。因此：
+
+- 客户端直连 CoreDNS 时，`bypass_ip` 直接按客户端源地址匹配
+- 客户端先到 `dnsmasq` 再转发到 CoreDNS 时，建议在 `dnsmasq` 开启 `ECS`
+- 为了传递完整客户端地址，`ECS` 掩码应设置为 `IPv4 /32`、`IPv6 /128`
+
+示例：`dnsmasq` / `OpenWrt dnsmasq` 开启 `ECS`
+
+```conf
+/etc/dnsmasq.conf
+# 传递完整客户端地址给下游 CoreDNS
+add-subnet=32,128
+```
+
+示例：`hostlist` 配合 `bypass_ip`
+
+```conf
+. {
+    hostlist {
+        parental on
+        safesearch on
+        bypass_ip 192.168.100.220
+        bypass_ip 2001:db8::1234/128
+    }
+    forward . 127.0.0.1:5353
+}
+```
+
+上面的链路中，如果前置 `dnsmasq` 已经开启 `add-subnet=32,128`，那么携带 `ECS 192.168.100.220/32/0` 或 `ECS 2001:db8::1234/128/0` 的请求将命中对应的 `bypass_ip`。
+
 ## 缓存目录
 
 远程下载的规则会保存到 `cache_dir` 目录（默认 `./hostlist/`），文件名为 URL 的 SHA256 哈希。重启时优先读取本地缓存，后台再同步远程更新。
