@@ -32,6 +32,10 @@ hostlist {
     block_type 0.0.0.0|nxdomain|empty  # 拦截响应类型，默认 0.0.0.0
     safesearch on|off             # 安全搜索，默认 off
     parental on|off               # 家长控制，默认 off
+    parental {                    # 家长控制独立规则源（可选）
+        url <remote-url>          # 家长控制远程规则 URL（可重复）
+        file <local-path>         # 家长控制本地规则文件（可重复）
+    }
     bypass_ip <ip/cidr>           # 客户端 IP 白名单，绕过家长控制和安全搜索（可重复）
     refresh <duration>            # 远程同步间隔，默认 4d
     cache_dir <path>              # 缓存目录，默认 ./hostlist/
@@ -263,7 +267,7 @@ hostlist {
 
 ## 家长控制
 
-`parental on` 自动加载赌博和恶意软件过滤列表。
+`parental on` 会启用家长控制，并优先加载 `parental { ... }` 中配置的独立规则源；当自定义家长规则下载失败、文件缺失或最终没有解析出任何规则时，会自动回退到内置的赌博、恶意软件和 NSFW 规则源。
 
 ```
 . {
@@ -278,6 +282,29 @@ hostlist {
 - 赌博网站
 - 恶意软件
 - NSFW网站
+
+也可以给家长控制单独指定本地文件和远程 URL：
+
+```conf
+. {
+    hostlist {
+        parental on
+        refresh 12h
+        cache_dir /var/lib/coredns/hostlist
+        parental {
+            url https://adguardteam.github.io/HostlistsRegistry/assets/filter_59.txt
+            file /etc/coredns/parental-extra.txt
+        }
+    }
+    forward . 8.8.8.8:53
+}
+```
+
+说明：
+- `parental { ... }` 只影响家长控制规则，不会和普通 `url` / `file` / `blocklist` 配置混在一起处理。
+- `parental { ... }` 继承外层 `refresh` 和 `cache_dir`；家长控制缓存目录固定为 `<cache_dir>/parental`。
+- 自定义家长控制规则可用时，优先使用自定义规则。
+- 自定义家长控制规则不可用时，会自动回退到内置规则源作为兜底。
 
 ## 客户端 IP 白名单
 

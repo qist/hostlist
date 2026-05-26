@@ -1,6 +1,7 @@
 package hostlist
 
 import (
+	"context"
 	"net"
 	"path/filepath"
 	"time"
@@ -14,6 +15,29 @@ import (
 
 var log = clog.NewWithPlugin(pluginName)
 
+var defaultParentalSources = []FilterSource{
+	{URL: "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/adblock/gambling.medium.txt"},
+	{URL: "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/adblock/tif.medium.txt"},
+	{URL: "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/adblock/nsfw.txt"},
+}
+
+type parseState struct {
+	sources             []FilterSource
+	allowSources        []FilterSource
+	userRules           []string
+	seenSources         map[string]struct{}
+	seenAllowSources    map[string]struct{}
+	seenUserRules       map[string]struct{}
+	cacheDir            string
+	refreshInterval     time.Duration
+	parentalSources     []FilterSource
+	seenParentalSources map[string]struct{}
+	parentalConfigured  bool
+	parentalExplicit    bool
+	inParentalBlock     bool
+	expectParentalBlock bool
+}
+
 func init() { plugin.Register(pluginName, setup) }
 
 func setup(c *caddy.Controller) error {
@@ -26,22 +50,50 @@ func setup(c *caddy.Controller) error {
 	// This ensures DNS queries work even before startup completes
 	h.rules.Store(emptyRuleSet())
 
+	ctx, cancel := context.WithCancel(context.Background())
+
 	c.OnStartup(func() error {
+		h.stopped.Store(false)
+
 		// Start async refresh immediately (no cache trie to avoid double memory)
 		go func() {
-			h.Update(h.loader.LoadAll())
+			result := h.loadAllWithContext(ctx)
+			if ctx.Err() != nil || h.stopped.Load() {
+				return
+			}
+			h.Update(result)
 		}()
 
 		return nil
 	})
 
-	stopChan := h.loader.StartPeriodicRefresh(func() {
-		result := h.loader.LoadAll()
-		h.Update(result)
-	})
+	var stopChans []chan struct{}
+	startRefresh := func(loader *Loader) {
+		if loader == nil {
+			return
+		}
+		stopChans = append(stopChans, loader.StartPeriodicRefresh(func() {
+			if ctx.Err() != nil || h.stopped.Load() {
+				return
+			}
+			result := h.loadAllWithContext(ctx)
+			if ctx.Err() != nil || h.stopped.Load() {
+				return
+			}
+			h.Update(result)
+		}))
+	}
+	startRefresh(h.loader)
+	startRefresh(h.parentalLoader)
+	if h.parentalLoader == nil {
+		startRefresh(h.parentalFallbackLoader)
+	}
 
 	c.OnShutdown(func() error {
-		close(stopChan)
+		cancel()
+		for _, stopChan := range stopChans {
+			close(stopChan)
+		}
 		h.Cleanup()
 		return nil
 	})
@@ -61,194 +113,267 @@ func parse(c *caddy.Controller) (*Hostlist, error) {
 		blockType: "0.0.0.0",
 	}
 
-	var sources []FilterSource
-	var allowSources []FilterSource
-	var userRules []string
-	seenSources := make(map[string]struct{})
-	seenAllowSources := make(map[string]struct{})
-	seenUserRules := make(map[string]struct{})
-	var cacheDir string
-	refreshInterval := 4 * 24 * time.Hour // default 4 days
+	state := parseState{
+		seenSources:         make(map[string]struct{}),
+		seenAllowSources:    make(map[string]struct{}),
+		seenUserRules:       make(map[string]struct{}),
+		refreshInterval:     4 * 24 * time.Hour,
+		seenParentalSources: make(map[string]struct{}),
+	}
 
 	config := dnsserver.GetConfig(c)
 
 	for c.Next() {
+		if c.Val() != pluginName {
+			if err := applyDirective(c, c.Val(), c.RemainingArgs(), config.Root, h, &state); err != nil {
+				return nil, err
+			}
+			continue
+		}
+
 		args := c.RemainingArgs()
 		if len(args) > 0 {
 			h.Origins = plugin.OriginsFromArgsOrServerBlock(args, c.ServerBlockKeys)
 		}
 
 		for c.NextBlock() {
-			switch c.Val() {
-			case "url":
-				if !c.NextArg() {
-					return nil, c.ArgErr()
-				}
-				sources = appendUniqueSource(sources, seenSources, FilterSource{URL: c.Val()})
-
-			case "file":
-				if !c.NextArg() {
-					return nil, c.ArgErr()
-				}
-				f := c.Val()
-				if !filepath.IsAbs(f) && config.Root != "" {
-					f = filepath.Join(config.Root, f)
-				}
-				sources = appendUniqueSource(sources, seenSources, FilterSource{File: f})
-
-			case "whitelist_url":
-				if !c.NextArg() {
-					return nil, c.ArgErr()
-				}
-				allowSources = appendUniqueSource(allowSources, seenAllowSources, FilterSource{URL: c.Val()})
-
-			case "whitelist_file":
-				if !c.NextArg() {
-					return nil, c.ArgErr()
-				}
-				f := c.Val()
-				if !filepath.IsAbs(f) && config.Root != "" {
-					f = filepath.Join(config.Root, f)
-				}
-				allowSources = appendUniqueSource(allowSources, seenAllowSources, FilterSource{File: f})
-
-			case "allowlist":
-				if !c.NextArg() {
-					return nil, c.ArgErr()
-				}
-				for _, rule := range append([]string{c.Val()}, c.RemainingArgs()...) {
-					userRules = appendUniqueRule(userRules, seenUserRules, rule)
-				}
-
-			case "blocklist":
-				if !c.NextArg() {
-					return nil, c.ArgErr()
-				}
-				for _, rule := range append([]string{c.Val()}, c.RemainingArgs()...) {
-					userRules = appendUniqueRule(userRules, seenUserRules, rule)
-				}
-
-			case "mode":
-				if !c.NextArg() {
-					return nil, c.ArgErr()
-				}
-				switch c.Val() {
-				case "blacklist", "whitelist":
-					h.mode = c.Val()
-				default:
-					return nil, c.Errf("invalid mode %q, must be 'blacklist' or 'whitelist'", c.Val())
-				}
-
-			case "refresh":
-				if !c.NextArg() {
-					return nil, c.ArgErr()
-				}
-				dur, err := time.ParseDuration(c.Val())
-				if err != nil {
-					return nil, c.Errf("invalid duration for refresh: %q", c.Val())
-				}
-				if dur < 0 {
-					return nil, c.Errf("refresh duration cannot be negative: %q", c.Val())
-				}
-				refreshInterval = dur
-
-			case "block_type":
-				if !c.NextArg() {
-					return nil, c.ArgErr()
-				}
-				switch c.Val() {
-				case "nxdomain", "empty", "0.0.0.0":
-					h.blockType = c.Val()
-				default:
-					return nil, c.Errf("invalid block_type %q, must be '0.0.0.0', 'nxdomain' or 'empty'", c.Val())
-				}
-
-			case "cache_dir":
-				if !c.NextArg() {
-					return nil, c.ArgErr()
-				}
-				d := c.Val()
-				if !filepath.IsAbs(d) && config.Root != "" {
-					d = filepath.Join(config.Root, d)
-				}
-				cacheDir = d
-
-			case "safesearch":
-				if !c.NextArg() {
-					return nil, c.ArgErr()
-				}
-				switch c.Val() {
-				case "on", "true":
-					h.safeSearch = NewSafeSearch(true)
-				case "off", "false":
-					h.safeSearch = NewSafeSearch(false)
-				default:
-					return nil, c.Errf("invalid safesearch value %q, must be 'on' or 'off'", c.Val())
-				}
-
-			case "parental":
-				if !c.NextArg() {
-					return nil, c.ArgErr()
-				}
-				switch c.Val() {
-				case "on", "true":
-					// Add parental control filter URLs (gambling + NSFW)
-					sources = appendUniqueSource(sources, seenSources, FilterSource{
-						URL: "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/adblock/gambling.medium.txt",
-					}) // Gambling
-					sources = appendUniqueSource(sources, seenSources, FilterSource{
-						URL: "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/adblock/tif.medium.txt",
-					}) // Malware / Phishing / Scam
-					sources = appendUniqueSource(sources, seenSources, FilterSource{
-						URL: "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/adblock/nsfw.txt",
-					}) // NSFW / Adult
-				case "off", "false":
-					// do nothing
-				default:
-					return nil, c.Errf("invalid parental value %q, must be 'on' or 'off'", c.Val())
-				}
-
-			case "bypass_ip":
-				if !c.NextArg() {
-					return nil, c.ArgErr()
-				}
-				for _, arg := range append([]string{c.Val()}, c.RemainingArgs()...) {
-					_, cidr, err := net.ParseCIDR(arg)
-					if err != nil {
-						// Try as plain IP (convert to /32 or /128)
-						ip := net.ParseIP(arg)
-						if ip == nil {
-							return nil, c.Errf("invalid IP or CIDR %q", arg)
-						}
-						if ip.To4() != nil {
-							_, cidr, _ = net.ParseCIDR(ip.String() + "/32")
-						} else {
-							_, cidr, _ = net.ParseCIDR(ip.String() + "/128")
-						}
-					}
-					h.bypassIPs = append(h.bypassIPs, *cidr)
-				}
-
-			default:
-				return nil, c.Errf("unknown property %q", c.Val())
+			if err := applyDirective(c, c.Val(), c.RemainingArgs(), config.Root, h, &state); err != nil {
+				return nil, err
 			}
 		}
+		state.inParentalBlock = false
+		state.expectParentalBlock = false
 	}
 
-	if len(sources) == 0 && len(allowSources) == 0 && len(userRules) == 0 {
+	if state.parentalConfigured && !state.parentalExplicit {
+		h.parentalEnabled = true
+	}
+
+	if len(state.sources) == 0 && len(state.allowSources) == 0 && len(state.userRules) == 0 && !h.parentalEnabled {
 		return nil, c.Err("hostlist requires at least one url, file, allowlist, or blocklist directive")
 	}
 
 	// Default cache directory: hostlist/ under coredns working directory
-	if cacheDir == "" {
-		cacheDir = "hostlist"
+	if state.cacheDir == "" {
+		state.cacheDir = "hostlist"
 		if config.Root != "" {
-			cacheDir = filepath.Join(config.Root, "hostlist")
+			state.cacheDir = filepath.Join(config.Root, "hostlist")
 		}
 	}
 
-	h.loader = NewLoader(sources, allowSources, userRules, refreshInterval, cacheDir)
+	if len(state.sources) > 0 || len(state.allowSources) > 0 || len(state.userRules) > 0 {
+		h.loader = NewLoader(state.sources, state.allowSources, state.userRules, state.refreshInterval, state.cacheDir)
+	}
+	if h.parentalEnabled {
+		parentalCacheDir := filepath.Join(state.cacheDir, "parental")
+		if len(state.parentalSources) > 0 {
+			h.parentalLoader = NewLoader(state.parentalSources, nil, nil, state.refreshInterval, parentalCacheDir)
+		}
+		h.parentalFallbackLoader = NewLoader(cloneSources(defaultParentalSources), nil, nil, state.refreshInterval, parentalCacheDir)
+	}
 	return h, nil
+}
+
+func applyDirective(c *caddy.Controller, name string, args []string, root string, h *Hostlist, state *parseState) error {
+	if name == "" || name == "}" {
+		state.inParentalBlock = false
+		state.expectParentalBlock = false
+		return nil
+	}
+
+	targetParental := state.inParentalBlock
+
+	if name == "{" {
+		if !state.expectParentalBlock {
+			return c.Errf("unknown property %q", name)
+		}
+		state.inParentalBlock = true
+		state.expectParentalBlock = false
+		return nil
+	}
+	state.expectParentalBlock = false
+
+	appendSource := func(source FilterSource) {
+		if targetParental {
+			state.parentalConfigured = true
+			state.parentalSources = appendUniqueSource(state.parentalSources, state.seenParentalSources, source)
+			return
+		}
+		state.sources = appendUniqueSource(state.sources, state.seenSources, source)
+	}
+	switch name {
+	case "url":
+		if len(args) == 0 {
+			return c.ArgErr()
+		}
+		appendSource(FilterSource{URL: args[0]})
+	case "file":
+		if len(args) == 0 {
+			return c.ArgErr()
+		}
+		f := args[0]
+		if !filepath.IsAbs(f) && root != "" {
+			f = filepath.Join(root, f)
+		}
+		appendSource(FilterSource{File: f})
+	case "whitelist_url":
+		if targetParental {
+			return c.Errf("unknown parental property %q", name)
+		}
+		if len(args) == 0 {
+			return c.ArgErr()
+		}
+		state.allowSources = appendUniqueSource(state.allowSources, state.seenAllowSources, FilterSource{URL: args[0]})
+	case "whitelist_file":
+		if targetParental {
+			return c.Errf("unknown parental property %q", name)
+		}
+		if len(args) == 0 {
+			return c.ArgErr()
+		}
+		f := args[0]
+		if !filepath.IsAbs(f) && root != "" {
+			f = filepath.Join(root, f)
+		}
+		state.allowSources = appendUniqueSource(state.allowSources, state.seenAllowSources, FilterSource{File: f})
+	case "allowlist":
+		if targetParental {
+			return c.Errf("unknown parental property %q", name)
+		}
+		if len(args) == 0 {
+			return c.ArgErr()
+		}
+		for _, rule := range args {
+			state.userRules = appendUniqueRule(state.userRules, state.seenUserRules, rule)
+		}
+	case "blocklist":
+		if targetParental {
+			return c.Errf("unknown parental property %q", name)
+		}
+		if len(args) == 0 {
+			return c.ArgErr()
+		}
+		for _, rule := range args {
+			state.userRules = appendUniqueRule(state.userRules, state.seenUserRules, rule)
+		}
+	case "mode":
+		if targetParental {
+			return c.Errf("unknown parental property %q", name)
+		}
+		if len(args) == 0 {
+			return c.ArgErr()
+		}
+		switch args[0] {
+		case "blacklist", "whitelist":
+			h.mode = args[0]
+		default:
+			return c.Errf("invalid mode %q, must be 'blacklist' or 'whitelist'", args[0])
+		}
+	case "refresh":
+		if targetParental {
+			return c.Errf("unknown parental property %q", name)
+		}
+		if len(args) == 0 {
+			return c.ArgErr()
+		}
+		dur, err := time.ParseDuration(args[0])
+		if err != nil {
+			return c.Errf("invalid duration for refresh: %q", args[0])
+		}
+		if dur < 0 {
+			return c.Errf("refresh duration cannot be negative: %q", args[0])
+		}
+		state.refreshInterval = dur
+	case "block_type":
+		if targetParental {
+			return c.Errf("unknown parental property %q", name)
+		}
+		if len(args) == 0 {
+			return c.ArgErr()
+		}
+		switch args[0] {
+		case "nxdomain", "empty", "0.0.0.0":
+			h.blockType = args[0]
+		default:
+			return c.Errf("invalid block_type %q, must be '0.0.0.0', 'nxdomain' or 'empty'", args[0])
+		}
+	case "cache_dir":
+		if targetParental {
+			return c.Errf("unknown parental property %q", name)
+		}
+		if len(args) == 0 {
+			return c.ArgErr()
+		}
+		d := args[0]
+		if !filepath.IsAbs(d) && root != "" {
+			d = filepath.Join(root, d)
+		}
+		state.cacheDir = d
+	case "safesearch":
+		if targetParental {
+			return c.Errf("unknown parental property %q", name)
+		}
+		if len(args) == 0 {
+			return c.ArgErr()
+		}
+		switch args[0] {
+		case "on", "true":
+			h.safeSearch = NewSafeSearch(true)
+		case "off", "false":
+			h.safeSearch = NewSafeSearch(false)
+		default:
+			return c.Errf("invalid safesearch value %q, must be 'on' or 'off'", args[0])
+		}
+	case "parental":
+		if targetParental {
+			return c.Errf("unknown parental property %q", name)
+		}
+		if len(args) > 1 {
+			return c.ArgErr()
+		}
+		if len(args) == 1 {
+			state.parentalExplicit = true
+			switch args[0] {
+			case "on", "true":
+				h.parentalEnabled = true
+			case "off", "false":
+				h.parentalEnabled = false
+			default:
+				return c.Errf("invalid parental value %q, must be 'on' or 'off'", args[0])
+			}
+			return nil
+		}
+		state.parentalConfigured = true
+		state.expectParentalBlock = true
+	case "bypass_ip":
+		if targetParental {
+			return c.Errf("unknown parental property %q", name)
+		}
+		if len(args) == 0 {
+			return c.ArgErr()
+		}
+		for _, arg := range args {
+			_, cidr, err := net.ParseCIDR(arg)
+			if err != nil {
+				ip := net.ParseIP(arg)
+				if ip == nil {
+					return c.Errf("invalid IP or CIDR %q", arg)
+				}
+				if ip.To4() != nil {
+					_, cidr, _ = net.ParseCIDR(ip.String() + "/32")
+				} else {
+					_, cidr, _ = net.ParseCIDR(ip.String() + "/128")
+				}
+			}
+			h.bypassIPs = append(h.bypassIPs, *cidr)
+		}
+	default:
+		if targetParental {
+			return c.Errf("unknown parental property %q", name)
+		}
+		return c.Errf("unknown property %q", name)
+	}
+	return nil
 }
 
 func appendUniqueSource(sources []FilterSource, seen map[string]struct{}, source FilterSource) []FilterSource {
@@ -274,4 +399,13 @@ func appendUniqueRule(rules []string, seen map[string]struct{}, rule string) []s
 	}
 	seen[rule] = struct{}{}
 	return append(rules, rule)
+}
+
+func cloneSources(sources []FilterSource) []FilterSource {
+	if len(sources) == 0 {
+		return nil
+	}
+	cloned := make([]FilterSource, len(sources))
+	copy(cloned, sources)
+	return cloned
 }

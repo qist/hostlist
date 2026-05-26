@@ -1,6 +1,7 @@
 package hostlist
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/json"
@@ -9,7 +10,6 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
-	"strings"
 	"sync/atomic"
 	"time"
 )
@@ -147,15 +147,15 @@ func (l *Loader) loadMeta(cachePath string) cacheMeta {
 //	! Version: 2026.0512.2131.40                      (version-based)
 //
 // The returned value is in HTTP RFC 1123 format for use with If-Modified-Since.
-func parseLastModifiedFromContent(content string) string {
+func parseLastModifiedFromBytes(content []byte) string {
 	var rawDate string
-	for _, line := range strings.Split(content, "\n") {
-		line = strings.TrimSpace(line)
-		if strings.HasPrefix(line, "! Last modified:") {
-			rawDate = strings.TrimSpace(line[len("! Last modified:"):])
-			break
+	forEachTrimmedLine(content, func(line []byte) bool {
+		if bytes.HasPrefix(line, []byte("! Last modified:")) {
+			rawDate = string(bytes.TrimSpace(line[len("! Last modified:"):]))
+			return false
 		}
-	}
+		return true
+	})
 	if rawDate == "" {
 		return ""
 	}
@@ -196,15 +196,14 @@ func (l *Loader) LoadAll() ParseResult {
 // loadAllWithContext loads rules with context for timeout control
 func (l *Loader) loadAllWithContext(ctx context.Context) ParseResult {
 	l.ensureCacheDir()
-	var merged ParseResult
-	merged.SkipUpdate = false // Always allow update to ensure DNS queries work
+	acc := newResultAccumulator()
 
 	for _, src := range l.sources {
 		// Check if context is cancelled
 		select {
 		case <-ctx.Done():
 			log.Warningf("LoadAll cancelled, returning partial result")
-			return merged
+			return acc.result
 		default:
 		}
 
@@ -213,7 +212,7 @@ func (l *Loader) loadAllWithContext(ctx context.Context) ParseResult {
 			log.Warningf("Failed to load rules from %s: %v", sourceName(src), err)
 			continue
 		}
-		mergeResult(&merged, result)
+		acc.addAll(result)
 	}
 
 	for _, src := range l.allowSources {
@@ -221,7 +220,7 @@ func (l *Loader) loadAllWithContext(ctx context.Context) ParseResult {
 		select {
 		case <-ctx.Done():
 			log.Warningf("LoadAll cancelled, returning partial result")
-			return merged
+			return acc.result
 		default:
 		}
 
@@ -230,28 +229,24 @@ func (l *Loader) loadAllWithContext(ctx context.Context) ParseResult {
 			log.Warningf("Failed to load allowlist from %s: %v", sourceName(src), err)
 			continue
 		}
-		// Only add allowlist rules from allowSources, not blocked rules
-		merged.Allowlist = append(merged.Allowlist, result.Allowlist...)
-		merged.RegexAllow = append(merged.RegexAllow, result.RegexAllow...)
+		acc.addAllowOnly(result)
 	}
 
 	if len(l.userRules) > 0 {
 		userResult := ParseRules(multiLineReader(l.userRules))
-		mergeResult(&merged, userResult)
+		acc.addAll(userResult)
 	}
 
-	deduplicateResult(&merged)
 	// log.Infof("LoadAll completed: SkipUpdate=%v, Blocked=%d, Exact=%d, Allowlist=%d",
-		// merged.SkipUpdate, len(merged.Blocked), len(merged.BlockedExact), len(merged.Allowlist))
-	return merged
+	// acc.result.SkipUpdate, len(acc.result.Blocked), len(acc.result.BlockedExact), len(acc.result.Allowlist))
+	return acc.result
 }
 
 // LoadFromCache loads rules from local cache only (no network requests).
 // Used for fast startup before background refresh completes.
 func (l *Loader) LoadFromCache() ParseResult {
 	l.ensureCacheDir()
-	var merged ParseResult
-	merged.SkipUpdate = false // Always allow update to ensure DNS queries work
+	acc := newResultAccumulator()
 
 	for _, src := range l.sources {
 		result, err := l.loadFromCacheOnly(src)
@@ -259,7 +254,7 @@ func (l *Loader) LoadFromCache() ParseResult {
 			log.Debugf("No cached rules for %s: %v", sourceName(src), err)
 			continue
 		}
-		mergeResult(&merged, result)
+		acc.addAll(result)
 	}
 
 	for _, src := range l.allowSources {
@@ -268,18 +263,15 @@ func (l *Loader) LoadFromCache() ParseResult {
 			log.Debugf("No cached allowlist for %s: %v", sourceName(src), err)
 			continue
 		}
-		// Only add allowlist rules from allowSources, not blocked rules
-		merged.Allowlist = append(merged.Allowlist, result.Allowlist...)
-		merged.RegexAllow = append(merged.RegexAllow, result.RegexAllow...)
+		acc.addAllowOnly(result)
 	}
 
 	if len(l.userRules) > 0 {
 		userResult := ParseRules(multiLineReader(l.userRules))
-		mergeResult(&merged, userResult)
+		acc.addAll(userResult)
 	}
 
-	deduplicateResult(&merged)
-	return merged
+	return acc.result
 }
 
 // loadSource loads rules from a single source. For URLs, tries remote with
@@ -302,7 +294,7 @@ func (l *Loader) loadFromCacheOnly(src FilterSource) (ParseResult, error) {
 		if cached == nil {
 			return ParseResult{}, fmt.Errorf("no cache for %s", src.URL)
 		}
-		return ParseRules(strings.NewReader(string(cached))), nil
+		return ParseRules(bytes.NewReader(cached)), nil
 	}
 	if src.File != "" {
 		return l.loadFromFile(src.File)
@@ -325,33 +317,31 @@ func (l *Loader) loadFromURL(url string) (ParseResult, error) {
 	if meta.ContentModified != "" {
 		ifModifiedSince = meta.ContentModified
 	} else if cached != nil {
-		ifModifiedSince = parseLastModifiedFromContent(string(cached))
+		ifModifiedSince = parseLastModifiedFromBytes(cached)
 	}
 
 	data, statusCode, _, err := l.fetchURL(url, ifModifiedSince, "")
 	if err == nil && statusCode == http.StatusNotModified {
 		log.Debugf("Remote %s not modified (304), using cache", url)
 		if cached != nil {
-			result := ParseRules(strings.NewReader(string(cached)))
+			result := ParseRules(bytes.NewReader(cached))
 			result.SkipUpdate = true
 			return result, nil
 		}
 	}
 	if err == nil && statusCode == http.StatusOK {
-		newContent := string(data)
-		newModified := extractLastModified(newContent)
-		newVersion := extractVersion(newContent)
+		newModified := extractLastModifiedBytes(data)
+		newVersion := extractVersionBytes(data)
 
 		// Compare content identifiers: if same, skip trie rebuild
 		if cached != nil {
-			cachedContent := string(cached)
-			cachedModified := extractLastModified(cachedContent)
-			cachedVersion := extractVersion(cachedContent)
+			cachedModified := extractLastModifiedBytes(cached)
+			cachedVersion := extractVersionBytes(cached)
 			if newModified != "" && newModified == cachedModified &&
 				newVersion == cachedVersion {
 				log.Debugf("Content %s unchanged (%s), skipping rebuild", url, newModified)
 				l.saveCache(cachePath, data)
-				result := ParseRules(strings.NewReader(cachedContent))
+				result := ParseRules(bytes.NewReader(cached))
 				result.SkipUpdate = true
 				return result, nil
 			}
@@ -363,36 +353,46 @@ func (l *Loader) loadFromURL(url string) (ParseResult, error) {
 			ContentModified: newModified,
 			ContentVersion:  newVersion,
 		})
-		return ParseRules(strings.NewReader(newContent)), nil
+		return ParseRules(bytes.NewReader(data)), nil
 	}
 
 	// Remote failed, try cache
 	if cached != nil {
 		log.Warningf("Failed to download %s: %v, using cache", url, err)
-		return ParseRules(strings.NewReader(string(cached))), nil
+		return ParseRules(bytes.NewReader(cached)), nil
 	}
 
 	return ParseResult{}, fmt.Errorf("download failed and no cache available: %w", err)
 }
 
-// extractLastModified returns the raw ! Last modified: value from content.
-func extractLastModified(content string) string {
-	for _, line := range strings.Split(content, "\n") {
-		line = strings.TrimSpace(line)
-		if strings.HasPrefix(line, "! Last modified:") {
-			return strings.TrimSpace(line[len("! Last modified:"):])
+// extractLastModifiedBytes returns the raw ! Last modified: value from content.
+func extractLastModifiedBytes(content []byte) string {
+	var value string
+	forEachTrimmedLine(content, func(line []byte) bool {
+		if bytes.HasPrefix(line, []byte("! Last modified:")) {
+			value = string(bytes.TrimSpace(line[len("! Last modified:"):]))
+			return false
 		}
+		return true
+	})
+	if value != "" {
+		return value
 	}
 	return ""
 }
 
-// extractVersion returns the raw ! Version: value from content.
-func extractVersion(content string) string {
-	for _, line := range strings.Split(content, "\n") {
-		line = strings.TrimSpace(line)
-		if strings.HasPrefix(line, "! Version:") {
-			return strings.TrimSpace(line[len("! Version:"):])
+// extractVersionBytes returns the raw ! Version: value from content.
+func extractVersionBytes(content []byte) string {
+	var value string
+	forEachTrimmedLine(content, func(line []byte) bool {
+		if bytes.HasPrefix(line, []byte("! Version:")) {
+			value = string(bytes.TrimSpace(line[len("! Version:"):]))
+			return false
 		}
+		return true
+	})
+	if value != "" {
+		return value
 	}
 	return ""
 }
@@ -480,51 +480,112 @@ func sourceName(src FilterSource) string {
 	return src.File
 }
 
-func mergeResult(dst *ParseResult, src ParseResult) {
-	dst.Blocked = append(dst.Blocked, src.Blocked...)
-	dst.BlockedExact = append(dst.BlockedExact, src.BlockedExact...)
-	dst.Allowlist = append(dst.Allowlist, src.Allowlist...)
-	dst.RegexBlock = append(dst.RegexBlock, src.RegexBlock...)
-	dst.RegexAllow = append(dst.RegexAllow, src.RegexAllow...)
-	dst.SkipUpdate = dst.SkipUpdate && src.SkipUpdate
-	// Merge IPMap
-	if src.IPMap != nil {
-		if dst.IPMap == nil {
-			dst.IPMap = make(map[string]string)
-		}
-		for k, v := range src.IPMap {
-			dst.IPMap[k] = v
-		}
+type resultAccumulator struct {
+	result         ParseResult
+	seenBlocked    map[string]struct{}
+	seenExact      map[string]struct{}
+	seenAllow      map[string]struct{}
+	seenRegexBlock map[string]struct{}
+	seenRegexAllow map[string]struct{}
+}
+
+func newResultAccumulator() *resultAccumulator {
+	return &resultAccumulator{
+		result: ParseResult{
+			SkipUpdate: false,
+		},
+		seenBlocked:    make(map[string]struct{}),
+		seenExact:      make(map[string]struct{}),
+		seenAllow:      make(map[string]struct{}),
+		seenRegexBlock: make(map[string]struct{}),
+		seenRegexAllow: make(map[string]struct{}),
 	}
 }
 
-func deduplicateResult(result *ParseResult) {
-	result.Blocked = deduplicateStrings(result.Blocked)
-	result.BlockedExact = deduplicateStrings(result.BlockedExact)
-	result.Allowlist = deduplicateStrings(result.Allowlist)
-	result.RegexBlock = deduplicateStrings(result.RegexBlock)
-	result.RegexAllow = deduplicateStrings(result.RegexAllow)
+func (a *resultAccumulator) addAll(src ParseResult) {
+	a.addBlocked(src.Blocked)
+	a.addExact(src.BlockedExact, src.IPMap)
+	a.addAllow(src.Allowlist)
+	a.addRegexBlock(src.RegexBlock)
+	a.addRegexAllow(src.RegexAllow)
+	a.result.SkipUpdate = a.result.SkipUpdate && src.SkipUpdate
 }
 
-func deduplicateStrings(values []string) []string {
-	if len(values) < 2 {
-		return values
-	}
-	seen := make(map[string]struct{}, len(values))
-	n := 0
+func (a *resultAccumulator) addAllowOnly(src ParseResult) {
+	a.addAllow(src.Allowlist)
+	a.addRegexAllow(src.RegexAllow)
+}
+
+func (a *resultAccumulator) addBlocked(values []string) {
 	for _, value := range values {
 		if value == "" {
 			continue
 		}
-		if _, ok := seen[value]; ok {
+		if _, ok := a.seenBlocked[value]; ok {
 			continue
 		}
-		seen[value] = struct{}{}
-		values[n] = value
-		n++
+		a.seenBlocked[value] = struct{}{}
+		a.result.Blocked = append(a.result.Blocked, value)
 	}
-	clear(values[n:])
-	return values[:n]
+}
+
+func (a *resultAccumulator) addExact(values []string, ipMap map[string]string) {
+	for _, value := range values {
+		if value == "" {
+			continue
+		}
+		if _, ok := a.seenExact[value]; !ok {
+			a.seenExact[value] = struct{}{}
+			a.result.BlockedExact = append(a.result.BlockedExact, value)
+		}
+		if ipMap != nil {
+			if ip, ok := ipMap[value]; ok {
+				if a.result.IPMap == nil {
+					a.result.IPMap = make(map[string]string)
+				}
+				a.result.IPMap[value] = ip
+			}
+		}
+	}
+}
+
+func (a *resultAccumulator) addAllow(values []string) {
+	for _, value := range values {
+		if value == "" {
+			continue
+		}
+		if _, ok := a.seenAllow[value]; ok {
+			continue
+		}
+		a.seenAllow[value] = struct{}{}
+		a.result.Allowlist = append(a.result.Allowlist, value)
+	}
+}
+
+func (a *resultAccumulator) addRegexBlock(values []string) {
+	for _, value := range values {
+		if value == "" {
+			continue
+		}
+		if _, ok := a.seenRegexBlock[value]; ok {
+			continue
+		}
+		a.seenRegexBlock[value] = struct{}{}
+		a.result.RegexBlock = append(a.result.RegexBlock, value)
+	}
+}
+
+func (a *resultAccumulator) addRegexAllow(values []string) {
+	for _, value := range values {
+		if value == "" {
+			continue
+		}
+		if _, ok := a.seenRegexAllow[value]; ok {
+			continue
+		}
+		a.seenRegexAllow[value] = struct{}{}
+		a.result.RegexAllow = append(a.result.RegexAllow, value)
+	}
 }
 
 type httpError struct {
@@ -538,10 +599,69 @@ func (e *httpError) Error() string {
 
 // multiLineReader creates an io.Reader from a slice of lines.
 func multiLineReader(lines []string) io.Reader {
-	var b strings.Builder
-	for _, l := range lines {
-		b.WriteString(l)
-		b.WriteByte('\n')
+	return &sliceLineReader{lines: lines}
+}
+
+func forEachTrimmedLine(content []byte, fn func([]byte) bool) {
+	start := 0
+	for start <= len(content) {
+		end := bytes.IndexByte(content[start:], '\n')
+		if end == -1 {
+			line := bytes.TrimSpace(content[start:])
+			if len(line) > 0 && !fn(line) {
+				return
+			}
+			return
+		}
+
+		line := bytes.TrimSpace(content[start : start+end])
+		if len(line) > 0 && !fn(line) {
+			return
+		}
+		start += end + 1
 	}
-	return strings.NewReader(b.String())
+}
+
+type sliceLineReader struct {
+	lines       []string
+	lineIdx     int
+	byteIdx     int
+	emitNewline bool
+}
+
+func (r *sliceLineReader) Read(p []byte) (int, error) {
+	if len(p) == 0 {
+		return 0, nil
+	}
+
+	n := 0
+	for n < len(p) {
+		if r.lineIdx >= len(r.lines) {
+			if n == 0 {
+				return 0, io.EOF
+			}
+			return n, nil
+		}
+
+		if r.emitNewline {
+			p[n] = '\n'
+			n++
+			r.emitNewline = false
+			r.lineIdx++
+			r.byteIdx = 0
+			continue
+		}
+
+		line := r.lines[r.lineIdx]
+		if r.byteIdx >= len(line) {
+			r.emitNewline = true
+			continue
+		}
+
+		copied := copy(p[n:], line[r.byteIdx:])
+		n += copied
+		r.byteIdx += copied
+	}
+
+	return n, nil
 }

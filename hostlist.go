@@ -8,6 +8,7 @@ import (
 	"runtime/debug"
 	"strings"
 	"sync/atomic"
+	"time"
 
 	"github.com/coredns/coredns/plugin"
 	"github.com/coredns/coredns/plugin/metrics"
@@ -18,6 +19,8 @@ import (
 
 const pluginName = "hostlist"
 const defaultTTL = 600
+
+var memoryReleasePending atomic.Bool
 
 // safeSearchResponseWriter wraps a ResponseWriter to rewrite responses with SafeSearch CNAME
 type safeSearchResponseWriter struct {
@@ -110,12 +113,16 @@ type Hostlist struct {
 
 	rules atomic.Value // stores *ruleSet; published as a complete immutable snapshot
 
-	mode       string      // "blacklist" | "whitelist"
-	blockType  string      // "0.0.0.0" | "nxdomain" | "empty"
-	safeSearch *SafeSearch // safe search handler
-	loader     *Loader
+	mode                   string      // "blacklist" | "whitelist"
+	blockType              string      // "0.0.0.0" | "nxdomain" | "empty"
+	safeSearch             *SafeSearch // safe search handler
+	loader                 *Loader
+	parentalEnabled        bool
+	parentalLoader         *Loader
+	parentalFallbackLoader *Loader
 
 	bypassIPs []net.IPNet // client IPs that bypass parental control and safe search
+	stopped   atomic.Bool
 }
 
 type ruleSet struct {
@@ -124,7 +131,6 @@ type ruleSet struct {
 	allowTrie    *CompactTrie
 	blockRegexps []*regexp.Regexp
 	allowRegexps []*regexp.Regexp
-	ipMap        map[string]string // domain -> IP mapping for hosts format rules
 }
 
 func (h *Hostlist) Name() string { return pluginName }
@@ -172,8 +178,6 @@ func (h *Hostlist) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *dns.Ms
 		}
 	}
 
-	name := strings.ToLower(qname)
-
 	rules := h.currentRules()
 
 	// Ultra-fast path: if no rules loaded at all, immediately pass to next
@@ -198,16 +202,9 @@ func (h *Hostlist) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *dns.Ms
 		return plugin.NextOrFailure(h.Name(), h.Next, ctx, w, sanitizedRequestForUpstream(r))
 	}
 
-	domainBlocked := rules.domainTrie.LookupWithParentCheck(name)
-	exactBlocked := rules.exactTrie.Lookup(name)
-	allowed := rules.allowTrie.LookupWithParentCheck(name)
-	blockRegex := MatchAny(name, rules.blockRegexps)
-	allowRegex := MatchAny(name, rules.allowRegexps)
-
-	blocked := domainBlocked || exactBlocked || blockRegex
-	if allowRegex {
-		allowed = true
-	}
+	name := strings.ToLower(qname)
+	nameLabels := labelsFromFQDNLower(name)
+	blocked, allowed, exactBlockIP := h.evaluateRules(rules, name, nameLabels, safeSearchEntry != nil)
 
 	var shouldBlock bool
 	switch h.mode {
@@ -252,12 +249,9 @@ func (h *Hostlist) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *dns.Ms
 		m.Rcode = dns.RcodeSuccess
 	default: // "0.0.0.0" or any value
 		m.Rcode = dns.RcodeSuccess
-		// Check if we have a specific IP for this domain from hosts format rules
 		blockIP := h.blockType
-		if rules.ipMap != nil {
-			if ip, ok := rules.ipMap[name]; ok {
-				blockIP = ip
-			}
+		if exactBlockIP != "" {
+			blockIP = exactBlockIP
 		}
 		// Parse the IP address
 		ipAddr := net.ParseIP(blockIP)
@@ -275,6 +269,72 @@ func (h *Hostlist) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *dns.Ms
 	return m.Rcode, nil
 }
 
+func (h *Hostlist) evaluateRules(rules *ruleSet, name string, nameLabels []string, needAllowedForSafeSearch bool) (bool, bool, string) {
+	if h.mode == "whitelist" {
+		domainBlocked := false
+		if rules.domainTrie.Len() > 0 {
+			domainBlocked = rules.domainTrie.LookupWithParentCheckLabels(nameLabels)
+		}
+
+		exactBlocked, exactBlockIP := false, ""
+		if rules.exactTrie.Len() > 0 {
+			exactBlocked, exactBlockIP = rules.exactTrie.LookupExactValueLabels(nameLabels)
+		}
+
+		allowed := false
+		if rules.allowTrie.Len() > 0 {
+			allowed = rules.allowTrie.LookupWithParentCheckLabels(nameLabels)
+		}
+		if !allowed && len(rules.allowRegexps) > 0 && MatchAny(name, rules.allowRegexps) {
+			allowed = true
+		}
+
+		blockRegex := false
+		if len(rules.blockRegexps) > 0 {
+			blockRegex = MatchAny(name, rules.blockRegexps)
+		}
+		return domainBlocked || exactBlocked || blockRegex, allowed, exactBlockIP
+	}
+
+	domainBlocked := false
+	if rules.domainTrie.Len() > 0 {
+		domainBlocked = rules.domainTrie.LookupWithParentCheckLabels(nameLabels)
+	}
+
+	exactBlocked, exactBlockIP := false, ""
+	if rules.exactTrie.Len() > 0 {
+		exactBlocked, exactBlockIP = rules.exactTrie.LookupExactValueLabels(nameLabels)
+	}
+
+	blocked := domainBlocked || exactBlocked
+	if !blocked && len(rules.blockRegexps) > 0 {
+		blocked = MatchAny(name, rules.blockRegexps)
+	}
+
+	if !blocked {
+		if needAllowedForSafeSearch {
+			allowed := false
+			if rules.allowTrie.Len() > 0 {
+				allowed = rules.allowTrie.LookupWithParentCheckLabels(nameLabels)
+			}
+			if !allowed && len(rules.allowRegexps) > 0 {
+				allowed = MatchAny(name, rules.allowRegexps)
+			}
+			return false, allowed, exactBlockIP
+		}
+		return false, false, exactBlockIP
+	}
+
+	allowed := false
+	if rules.allowTrie.Len() > 0 {
+		allowed = rules.allowTrie.LookupWithParentCheckLabels(nameLabels)
+	}
+	if !allowed && len(rules.allowRegexps) > 0 {
+		allowed = MatchAny(name, rules.allowRegexps)
+	}
+	return true, allowed, exactBlockIP
+}
+
 // Update rebuilds the tries and regexps from a ParseResult via atomic swap.
 // If SkipUpdate is true (content unchanged), the rebuild is skipped.
 // A new immutable snapshot is built off to the side and published in one store,
@@ -288,6 +348,10 @@ func (h *Hostlist) Update(result ParseResult) {
 			log.Errorf("Stack trace:\n%s", debug.Stack())
 		}
 	}()
+
+	if h.stopped.Load() {
+		return
+	}
 
 	// log.Infof("Update called: SkipUpdate=%v, rules.Load()=%v",
 	// result.SkipUpdate, h.rules.Load() != nil)
@@ -307,6 +371,10 @@ func (h *Hostlist) Update(result ParseResult) {
 	// log.Infof("Domain trie built (%d nodes). Building exact trie with %d entries...", newDomain.Len(), len(result.BlockedExact))
 	newExact := NewCompactTrie()
 	for _, d := range result.BlockedExact {
+		if ip, ok := result.IPMap[d]; ok {
+			newExact.insertExactValueNoLock(d, ip)
+			continue
+		}
 		newExact.insertExactNoLock(d) // Use lock-free insert for batch operation
 	}
 	// log.Infof("Exact trie built (%d nodes). Building allow trie with %d entries...", newExact.Len(), len(result.Allowlist))
@@ -325,7 +393,6 @@ func (h *Hostlist) Update(result ParseResult) {
 		allowTrie:    newAllow,
 		blockRegexps: newBlockRe,
 		allowRegexps: newAllowRe,
-		ipMap:        result.IPMap, // Copy the IP mappings
 	}
 
 	// log.Infof("Before Store: newRules.exactTrie.Len()=%d", newRules.exactTrie.Len())
@@ -336,26 +403,28 @@ func (h *Hostlist) Update(result ParseResult) {
 	newAllow.ClearChildrenMaps()
 
 	h.rules.Store(newRules)
-	storedRules := h.rules.Load()
-	if storedRules != nil {
-		// if rs, ok := storedRules.(*ruleSet); ok {
-		// log.Infof("After Store: exactTrie.Len()=%d", rs.exactTrie.Len())
-		// }
-	}
 
 	total := newDomain.Len() + newExact.Len()
+	blockedCount := newDomain.Len()
+	exactCount := newExact.Len()
+	allowCount := newAllow.Len()
+	blockRegexCount := len(newBlockRe)
+	allowRegexCount := len(newAllowRe)
+
+	result = ParseResult{}
+
 	DomainsLoaded.Set(float64(total))
 	log.Infof("Updated hostlist: %d blocked domains, %d exact, %d allowlist, %d block regexps, %d allow regexps",
-		newDomain.Len(), newExact.Len(), newAllow.Len(), len(newBlockRe), len(newAllowRe))
+		blockedCount, exactCount, allowCount, blockRegexCount, allowRegexCount)
 
-	// Force garbage collection to release unused memory
-	runtime.GC()
+	scheduleMemoryRelease()
 }
 
 // Cleanup releases all resources held by the Hostlist plugin.
 // This is called during shutdown to ensure proper memory cleanup,
 // especially important during reload operations.
 func (h *Hostlist) Cleanup() {
+	h.stopped.Store(true)
 	h.rules.Store(emptyRuleSet())
 	h.bypassIPs = nil
 
@@ -367,12 +436,83 @@ func (h *Hostlist) Cleanup() {
 
 	// Clear loader
 	h.loader = nil
+	h.parentalLoader = nil
+	h.parentalFallbackLoader = nil
 
-	// Force GC to reclaim memory
-	runtime.GC()
-	debug.FreeOSMemory()
+	scheduleMemoryRelease()
 
 	// log.Infof("Hostlist: cleanup completed")
+}
+
+func scheduleMemoryRelease() {
+	if !memoryReleasePending.CompareAndSwap(false, true) {
+		return
+	}
+
+	time.AfterFunc(100*time.Millisecond, func() {
+		runtime.GC()
+		debug.FreeOSMemory()
+		memoryReleasePending.Store(false)
+	})
+}
+
+// LoadAll merges the main rule sources with the optional parental rule set.
+func (h *Hostlist) LoadAll() ParseResult {
+	return h.loadAllWithContext(context.Background())
+}
+
+func (h *Hostlist) loadAllWithContext(ctx context.Context) ParseResult {
+	acc := newResultAccumulator()
+
+	if h.loader != nil {
+		acc.addAll(h.loader.loadAllWithContext(ctx))
+	}
+
+	if ctx.Err() != nil || h.stopped.Load() {
+		return acc.result
+	}
+
+	if h.parentalEnabled {
+		acc.addAll(h.loadParentalRules(ctx, false))
+	}
+
+	return acc.result
+}
+
+func (h *Hostlist) loadParentalRules(ctx context.Context, fromCache bool) ParseResult {
+	load := func(loader *Loader) ParseResult {
+		if loader == nil {
+			return ParseResult{}
+		}
+		if fromCache {
+			return loader.LoadFromCache()
+		}
+		return loader.loadAllWithContext(ctx)
+	}
+
+	if h.parentalLoader != nil {
+		result := load(h.parentalLoader)
+		if hasAnyRules(result) {
+			return result
+		}
+		if ctx.Err() != nil || h.stopped.Load() {
+			return result
+		}
+		if h.parentalFallbackLoader != nil {
+			log.Warningf("Parental custom rules unavailable, falling back to built-in parental sources")
+		}
+	}
+
+	return load(h.parentalFallbackLoader)
+}
+
+func hasAnyRules(result ParseResult) bool {
+	return len(result.Blocked) > 0 ||
+		len(result.BlockedExact) > 0 ||
+		len(result.Allowlist) > 0 ||
+		len(result.RegexBlock) > 0 ||
+		len(result.RegexAllow) > 0 ||
+		len(result.IPMap) > 0
 }
 
 func (h *Hostlist) currentRules() *ruleSet {

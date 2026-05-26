@@ -204,6 +204,41 @@ func TestServeDNSAAAA(t *testing.T) {
 	}
 }
 
+func TestServeDNSUsesHostsExactBlockIP(t *testing.T) {
+	exactTrie := NewCompactTrie()
+	exactTrie.InsertExactValue("hosts.example.com.", "127.0.0.1")
+
+	h := &Hostlist{
+		Next:      test.NextHandler(dns.RcodeSuccess, nil),
+		Origins:   []string{"."},
+		mode:      "blacklist",
+		blockType: "0.0.0.0",
+	}
+	h.rules.Store(makeRules(NewCompactTrie(), exactTrie, NewCompactTrie(), nil, nil))
+
+	req := new(dns.Msg)
+	req.SetQuestion("hosts.example.com.", dns.TypeA)
+	rec := dnstest.NewRecorder(&test.ResponseWriter{})
+
+	rcode, err := h.ServeDNS(context.Background(), rec, req)
+	if err != nil {
+		t.Fatalf("expected no error, got: %v", err)
+	}
+	if rcode != dns.RcodeSuccess {
+		t.Fatalf("expected RcodeSuccess, got %d", rcode)
+	}
+	if rec.Msg == nil || len(rec.Msg.Answer) != 1 {
+		t.Fatalf("expected single answer, got %#v", rec.Msg)
+	}
+	rr, ok := rec.Msg.Answer[0].(*dns.A)
+	if !ok {
+		t.Fatalf("expected A answer, got %T", rec.Msg.Answer[0])
+	}
+	if got, want := rr.A.String(), "127.0.0.1"; got != want {
+		t.Fatalf("expected block IP %q, got %q", want, got)
+	}
+}
+
 func TestServeDNSRegex(t *testing.T) {
 	h := &Hostlist{
 		Next:      test.NextHandler(dns.RcodeSuccess, nil),
