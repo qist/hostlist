@@ -293,6 +293,7 @@ hostlist {
         cache_dir /var/lib/coredns/hostlist
         parental {
             url https://adguardteam.github.io/HostlistsRegistry/assets/filter_59.txt
+            url https://raw.githubusercontent.com/hagezi/dns-blocklists/main/adblock/nsfw.txt
             file /etc/coredns/parental-extra.txt
         }
     }
