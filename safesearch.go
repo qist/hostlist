@@ -13,10 +13,22 @@ type SafeSearchEntry struct {
 	AAAA  net.IP // AAAA record (IPv6)
 }
 
-// safeSearchMap is the built-in safe search domain mapping.
+// safeSearchMap is the built-in safe search domain mapping (lazily initialized).
 // Key: queried domain (without trailing dot), Value: rewrite target.
 // Based on AdGuard Home's safe search implementation.
-var safeSearchMap = map[string]SafeSearchEntry{
+// Lazily initialized on first access to avoid memory use when plugin is not configured.
+var (
+	safeSearchOnce sync.Once
+	safeSearchData map[string]SafeSearchEntry
+)
+
+func getSafeSearchMap() map[string]SafeSearchEntry {
+	safeSearchOnce.Do(func() { safeSearchData = buildSafeSearchMap() })
+	return safeSearchData
+}
+
+func buildSafeSearchMap() map[string]SafeSearchEntry {
+	return map[string]SafeSearchEntry{
 	// Google (all country TLDs redirect to forcesafesearch.google.com)
 	"www.google.com":    {CNAME: "forcesafesearch.google.com."},
 	"www.google.ac":     {CNAME: "forcesafesearch.google.com."},
@@ -296,6 +308,7 @@ var safeSearchMap = map[string]SafeSearchEntry{
 
 	// Kiddle
 	"kiddle.co": {CNAME: "safe.kiddle.co."},
+	}
 }
 
 // SafeSearch handles safe search DNS rewrites.
@@ -307,8 +320,8 @@ type SafeSearch struct {
 
 // NewSafeSearch creates a new SafeSearch handler.
 func NewSafeSearch(enabled bool) *SafeSearch {
-	entries := make(map[string]SafeSearchEntry, len(safeSearchMap))
-	for k, v := range safeSearchMap {
+	entries := make(map[string]SafeSearchEntry, len(getSafeSearchMap()))
+	for k, v := range getSafeSearchMap() {
 		entries[k] = v
 	}
 	return &SafeSearch{

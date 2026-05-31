@@ -41,6 +41,8 @@ type parseState struct {
 func init() { plugin.Register(pluginName, setup) }
 
 func setup(c *caddy.Controller) error {
+	initMetrics()
+
 	h, err := parse(c)
 	if err != nil {
 		return plugin.Error(pluginName, err)
