@@ -372,6 +372,12 @@ add-subnet=32,128
 | `coredns_hostlist_blocked_requests_total` | Counter | 被拦截的请求数（标签：server, zone） |
 | `coredns_hostlist_domains_loaded` | Gauge | 当前加载的封锁域名数 |
 
+## Download
+
+编译好的二进制文件（含 hostlist 插件）：
+
+https://github.com/qist/coredns-plugins-suite/releases
+
 ## 编译
 
 ### 1. 克隆 CoreDNS 源码
