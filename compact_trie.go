@@ -266,11 +266,10 @@ func (ct *CompactTrie) Insert(domain string) {
 }
 
 func (ct *CompactTrie) insertNoLock(domain string) {
-	parts := getLabels(domain)
+	parts := labels(domain)
 	if len(parts) == 0 {
 		return
 	}
-	defer putLabels(parts)
 
 	nodeIdx := ct.rootIdx
 	for _, label := range parts {
@@ -304,11 +303,10 @@ func (ct *CompactTrie) insertExactNoLock(domain string) {
 }
 
 func (ct *CompactTrie) insertExactValueNoLock(domain, value string) {
-	parts := getLabels(domain)
+	parts := labels(domain)
 	if len(parts) == 0 {
 		return
 	}
-	defer putLabels(parts)
 
 	nodeIdx := ct.rootIdx
 	for _, label := range parts {
