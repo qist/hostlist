@@ -319,14 +319,12 @@ type SafeSearch struct {
 }
 
 // NewSafeSearch creates a new SafeSearch handler.
+// It shares the global immutable safeSearchData map rather than copying it,
+// since the global map is initialized once via sync.Once and never mutated.
 func NewSafeSearch(enabled bool) *SafeSearch {
-	entries := make(map[string]SafeSearchEntry, len(getSafeSearchMap()))
-	for k, v := range getSafeSearchMap() {
-		entries[k] = v
-	}
 	return &SafeSearch{
 		enabled: enabled,
-		entries: entries,
+		entries: getSafeSearchMap(),
 	}
 }
 

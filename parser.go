@@ -6,9 +6,16 @@ import (
 	"net"
 	"regexp"
 	"strings"
+	"sync"
 
 	"github.com/miekg/dns"
 )
+
+// stringSetPool reuses map[string]struct{} across ParseRules calls to
+// reduce GC pressure when parsing large filter lists.
+var stringSetPool = sync.Pool{
+	New: func() any { return make(map[string]struct{}, 1024) },
+}
 
 // ParseResult holds the parsed domains and regex patterns from rule files.
 type ParseResult struct {
@@ -24,11 +31,23 @@ type ParseResult struct {
 // ParseRules reads AdGuard-format rules from r and extracts domains.
 func ParseRules(r io.Reader) ParseResult {
 	var result ParseResult
-	seenBlocked := make(map[string]struct{})
-	seenBlockedExact := make(map[string]struct{})
-	seenAllowlist := make(map[string]struct{})
-	seenRegexBlock := make(map[string]struct{})
-	seenRegexAllow := make(map[string]struct{})
+	seenBlocked := stringSetPool.Get().(map[string]struct{})
+	seenBlockedExact := stringSetPool.Get().(map[string]struct{})
+	seenAllowlist := stringSetPool.Get().(map[string]struct{})
+	seenRegexBlock := stringSetPool.Get().(map[string]struct{})
+	seenRegexAllow := stringSetPool.Get().(map[string]struct{})
+	defer func() {
+		clear(seenBlocked)
+		clear(seenBlockedExact)
+		clear(seenAllowlist)
+		clear(seenRegexBlock)
+		clear(seenRegexAllow)
+		stringSetPool.Put(seenBlocked)
+		stringSetPool.Put(seenBlockedExact)
+		stringSetPool.Put(seenAllowlist)
+		stringSetPool.Put(seenRegexBlock)
+		stringSetPool.Put(seenRegexAllow)
+	}()
 	scanner := bufio.NewScanner(r)
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())

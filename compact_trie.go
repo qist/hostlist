@@ -1,13 +1,55 @@
 package hostlist
 
 import (
-	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
 
 	"github.com/miekg/dns"
 )
+
+// labelsPool reuses []string slices produced by labelsFromFQDNLower during
+// DNS query processing to avoid per-query heap allocations.
+var labelsPool = sync.Pool{
+	New: func() any { s := make([]string, 0, 16); return &s },
+}
+
+// getLabels returns a []string from the pool, cleared and filled with the
+// reversed labels of name. Callers must call putLabels when done.
+func getLabels(name string) []string {
+	fqdn := strings.TrimSuffix(name, ".")
+	if fqdn == "" {
+		return nil
+	}
+	pp := labelsPool.Get().(*[]string)
+	parts := (*pp)[:0]
+	// Split by '.' and reverse in-place
+	start := len(fqdn)
+	for i := len(fqdn) - 1; i >= 0; i-- {
+		if fqdn[i] == '.' {
+			parts = append(parts, fqdn[i+1:start])
+			start = i
+		}
+	}
+	if start > 0 {
+		parts = append(parts, fqdn[:start])
+	}
+	*pp = parts
+	return parts
+}
+
+// putLabels returns a slice obtained from getLabels to the pool.
+func putLabels(parts []string) {
+	if parts == nil {
+		return
+	}
+	// Check that parts is backed by the pool's allocation (capacity > 0)
+	if cap(parts) == 0 {
+		return
+	}
+	parts = parts[:0]
+	labelsPool.Put(&parts)
+}
 
 type CompactTrie struct {
 	nodes        []trieNodeCompact
@@ -224,10 +266,11 @@ func (ct *CompactTrie) Insert(domain string) {
 }
 
 func (ct *CompactTrie) insertNoLock(domain string) {
-	parts := labels(domain)
+	parts := getLabels(domain)
 	if len(parts) == 0 {
 		return
 	}
+	defer putLabels(parts)
 
 	nodeIdx := ct.rootIdx
 	for _, label := range parts {
@@ -261,10 +304,11 @@ func (ct *CompactTrie) insertExactNoLock(domain string) {
 }
 
 func (ct *CompactTrie) insertExactValueNoLock(domain, value string) {
-	parts := labels(domain)
+	parts := getLabels(domain)
 	if len(parts) == 0 {
 		return
 	}
+	defer putLabels(parts)
 
 	nodeIdx := ct.rootIdx
 	for _, label := range parts {
@@ -383,6 +427,10 @@ func (ct *CompactTrie) Len() int {
 	return int(ct.count.Load())
 }
 
+// ClearChildrenMaps releases the per-node child lookup maps to save memory
+// after the trie has been fully constructed. It also shrinks the nodes/labels/
+// values slices to their exact size to eliminate over-capacity from
+// incremental growth during insertion.
 func (ct *CompactTrie) ClearChildrenMaps() {
 	ct.mu.Lock()
 	defer ct.mu.Unlock()
@@ -396,43 +444,24 @@ func (ct *CompactTrie) ClearChildrenMaps() {
 		return
 	}
 
-	newNodes := make([]trieNodeCompact, 1, len(ct.nodes))
-	newNodes[0] = trieNodeCompact{}
-
-	var rebuild func(oldIdx, newIdx int)
-	rebuild = func(oldIdx, newIdx int) {
-		children := ct.childIndices(oldIdx)
-		if len(children) == 0 {
-			return
-		}
-
-		start := len(newNodes)
-		newNodes[newIdx].childrenOffset = int32(start)
-		newNodes[newIdx].childrenCount = int32(len(children))
-
-		newChildIdxs := make([]int, len(children))
-		for i, childOldIdx := range children {
-			oldChild := ct.nodes[childOldIdx]
-			newChild := trieNodeCompact{
-				labelOffset: oldChild.labelOffset,
-				labelLen:    oldChild.labelLen,
-				valueIdx:    oldChild.valueIdx,
-				flags:       oldChild.flags,
-			}
-			newChildIdxs[i] = len(newNodes)
-			newNodes = append(newNodes, newChild)
-		}
-
-		for i, childOldIdx := range children {
-			rebuild(childOldIdx, newChildIdxs[i])
-		}
-	}
-
-	rebuild(ct.rootIdx, 0)
-	ct.nodes = newNodes
-	ct.childMaps = nil
+	// Shrink the flat slices to their exact size (releases over-capacity).
+	ct.nodes = cloneNodesTight(ct.nodes)
 	ct.labels = cloneBytesTight(ct.labels)
 	ct.values = cloneStringsTight(ct.values)
+
+	// Retain only the root node's childMap for O(1) first-label lookup.
+	// All other nodes fall back to linear scan in findChild.
+	rootChildren := make(map[string]int, ct.nodes[0].childrenCount)
+	for i := int(ct.nodes[0].childrenOffset); i < int(ct.nodes[0].childrenOffset)+int(ct.nodes[0].childrenCount); i++ {
+		if i < len(ct.nodes) {
+			child := ct.nodes[i]
+			label := string(ct.labels[int(child.labelOffset) : int(child.labelOffset)+int(child.labelLen)])
+			rootChildren[label] = i
+		}
+	}
+	ct.childMaps = make([]map[string]int, 1)
+	ct.childMaps[0] = rootChildren
+
 	ct.labelOffsets = nil
 	ct.valueIndexes = nil
 }
@@ -459,9 +488,9 @@ func (ct *CompactTrie) childIndices(nodeIdx int) []int {
 	for _, idx := range ct.childMaps[nodeIdx] {
 		indices = append(indices, idx)
 	}
-	sort.Slice(indices, func(i, j int) bool {
-		return ct.nodeLabel(indices[i]) < ct.nodeLabel(indices[j])
-	})
+	// No sorting: trie correctness does not depend on child order.
+	// Sorting only improves cache locality during lookups, but the cost
+	// of allocating and sorting during rebuild outweighs the benefit.
 	return indices
 }
 
@@ -494,6 +523,15 @@ func (ct *CompactTrie) ensureChildMapsSize() {
 	if len(ct.childMaps) < len(ct.nodes) {
 		ct.childMaps = append(ct.childMaps, make([]map[string]int, len(ct.nodes)-len(ct.childMaps))...)
 	}
+}
+
+func cloneNodesTight(src []trieNodeCompact) []trieNodeCompact {
+	if len(src) == 0 {
+		return nil
+	}
+	dst := make([]trieNodeCompact, len(src))
+	copy(dst, src)
+	return dst
 }
 
 func cloneBytesTight(src []byte) []byte {

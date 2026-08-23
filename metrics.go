@@ -10,10 +10,15 @@ import (
 )
 
 var (
-	metricsOnce         sync.Once
-	RequestBlockCount   *prometheus.CounterVec
-	DomainsLoaded       prometheus.Gauge
+	metricsOnce       sync.Once
+	RequestBlockCount *prometheus.CounterVec
+	DomainsLoaded     prometheus.Gauge
 )
+
+// init ensures metrics are registered even in tests that bypass setup().
+func init() {
+	initMetrics()
+}
 
 func initMetrics() {
 	metricsOnce.Do(func() {

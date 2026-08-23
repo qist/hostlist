@@ -203,8 +203,9 @@ func (h *Hostlist) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *dns.Ms
 	}
 
 	name := strings.ToLower(qname)
-	nameLabels := labelsFromFQDNLower(name)
+	nameLabels := getLabels(name)
 	blocked, allowed, exactBlockIP := h.evaluateRules(rules, name, nameLabels, safeSearchEntry != nil)
+	putLabels(nameLabels)
 
 	var shouldBlock bool
 	switch h.mode {
@@ -311,17 +312,11 @@ func (h *Hostlist) evaluateRules(rules *ruleSet, name string, nameLabels []strin
 		blocked = MatchAny(name, rules.blockRegexps)
 	}
 
-	if !blocked {
-		if needAllowedForSafeSearch {
-			allowed := false
-			if rules.allowTrie.Len() > 0 {
-				allowed = rules.allowTrie.LookupWithParentCheckLabels(nameLabels)
-			}
-			if !allowed && len(rules.allowRegexps) > 0 {
-				allowed = MatchAny(name, rules.allowRegexps)
-			}
-			return false, allowed, exactBlockIP
-		}
+	// Only compute "allowed" when we need it:
+	//   - when the domain is blocked (to check for exception), or
+	//   - when safesearch needs to know if the domain is explicitly allowed.
+	needAllowed := blocked || needAllowedForSafeSearch
+	if !needAllowed {
 		return false, false, exactBlockIP
 	}
 
@@ -332,7 +327,7 @@ func (h *Hostlist) evaluateRules(rules *ruleSet, name string, nameLabels []strin
 	if !allowed && len(rules.allowRegexps) > 0 {
 		allowed = MatchAny(name, rules.allowRegexps)
 	}
-	return true, allowed, exactBlockIP
+	return blocked, allowed, exactBlockIP
 }
 
 // Update rebuilds the tries and regexps from a ParseResult via atomic swap.
@@ -368,6 +363,10 @@ func (h *Hostlist) Update(result ParseResult) {
 	for _, d := range result.Blocked {
 		newDomain.insertNoLock(d) // Use lock-free insert for batch operation
 	}
+	// Release the Blocked slice early so the string data can be GC'd
+	// while we build the remaining tries.
+	result.Blocked = nil
+
 	// log.Infof("Domain trie built (%d nodes). Building exact trie with %d entries...", newDomain.Len(), len(result.BlockedExact))
 	newExact := NewCompactTrie()
 	for _, d := range result.BlockedExact {
@@ -377,11 +376,15 @@ func (h *Hostlist) Update(result ParseResult) {
 		}
 		newExact.insertExactNoLock(d) // Use lock-free insert for batch operation
 	}
+	result.BlockedExact = nil
+	result.IPMap = nil
+
 	// log.Infof("Exact trie built (%d nodes). Building allow trie with %d entries...", newExact.Len(), len(result.Allowlist))
 	newAllow := NewCompactTrie()
 	for _, d := range result.Allowlist {
 		newAllow.insertNoLock(d) // Use lock-free insert for batch operation
 	}
+	result.Allowlist = nil
 	// log.Infof("All tries built. Compiling regexps...")
 
 	newBlockRe := CompileRegexps(result.RegexBlock)
@@ -444,15 +447,33 @@ func (h *Hostlist) Cleanup() {
 	// log.Infof("Hostlist: cleanup completed")
 }
 
+// lastGCHeap records the heap size after the last GC to detect whether
+// a meaningful amount of memory can be reclaimed.
+var lastGCHeap atomic.Int64
+
 func scheduleMemoryRelease() {
 	if !memoryReleasePending.CompareAndSwap(false, true) {
 		return
 	}
 
 	time.AfterFunc(100*time.Millisecond, func() {
+		defer memoryReleasePending.Store(false)
+
+		// Only run GC + FreeOSMemory if the live heap has grown since
+		// the last collection. This avoids unnecessary STW pauses when
+		// rule refreshes haven't actually changed the data.
+		var ms runtime.MemStats
+		runtime.ReadMemStats(&ms)
+		prev := lastGCHeap.Load()
+		// Trigger if this is the first time or heap grew by >25%
+		if prev > 0 && int64(ms.HeapAlloc) <= prev+(prev/4) {
+			return
+		}
 		runtime.GC()
 		debug.FreeOSMemory()
-		memoryReleasePending.Store(false)
+		var ms2 runtime.MemStats
+		runtime.ReadMemStats(&ms2)
+		lastGCHeap.Store(int64(ms2.HeapAlloc))
 	})
 }
 
@@ -533,6 +554,10 @@ func emptyRuleSet() *ruleSet {
 // isBypassIP checks if the given IP is in the bypass whitelist.
 // It handles IPv6-mapped IPv4 addresses (e.g., ::ffff:172.18.44.255).
 func (h *Hostlist) isBypassIP(ip string) bool {
+	if len(h.bypassIPs) == 0 {
+		return false
+	}
+
 	clientIP := net.ParseIP(ip)
 	if clientIP == nil {
 		return false

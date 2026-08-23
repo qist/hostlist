@@ -98,4 +98,10 @@ func TestCompactTrieClearChildrenMapsShrinksBackingCapacity(t *testing.T) {
 	if cap(trie.values) != len(trie.values) {
 		t.Fatalf("expected values capacity to shrink to len, got len=%d cap=%d", len(trie.values), cap(trie.values))
 	}
+	if trie.labelOffsets != nil {
+		t.Fatal("expected labelOffsets to be nil after ClearChildrenMaps")
+	}
+	if trie.valueIndexes != nil {
+		t.Fatal("expected valueIndexes to be nil after ClearChildrenMaps")
+	}
 }
