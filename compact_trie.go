@@ -241,7 +241,7 @@ func (ct *CompactTrie) addChild(parentIdx int, label string, blocked, exact bool
 	newIdx := currentOffset + currentCount
 
 	// 优化：总是追加到末尾，不保证子节点连续存储
-	// 这样可以避免昂贵的数组移动和索引更新操作
+	// ClearChildrenMaps 会在构建完成后做完整重建使子节点连续
 	newIdx = len(ct.nodes)
 	ct.nodes = append(ct.nodes, newNode)
 	ct.childMaps = append(ct.childMaps, nil)
@@ -442,23 +442,50 @@ func (ct *CompactTrie) ClearChildrenMaps() {
 		return
 	}
 
-	// Shrink the flat slices to their exact size (releases over-capacity).
-	ct.nodes = cloneNodesTight(ct.nodes)
-	ct.labels = cloneBytesTight(ct.labels)
-	ct.values = cloneStringsTight(ct.values)
+	// Rebuild the nodes array so that every parent's children are stored
+	// contiguously. During insertion, children are appended at the end of
+	// ct.nodes (newIdx = len(ct.nodes)), which means different parents'
+	// children interleave. After this rebuild, findChild's linear scan
+	// over [childrenOffset, childrenOffset+childrenCount) is correct.
+	newNodes := make([]trieNodeCompact, 1, len(ct.nodes))
+	newNodes[0] = trieNodeCompact{}
 
-	// Retain only the root node's childMap for O(1) first-label lookup.
-	// All other nodes fall back to linear scan in findChild.
-	rootChildren := make(map[string]int, ct.nodes[0].childrenCount)
-	for i := int(ct.nodes[0].childrenOffset); i < int(ct.nodes[0].childrenOffset)+int(ct.nodes[0].childrenCount); i++ {
-		if i < len(ct.nodes) {
-			child := ct.nodes[i]
-			label := string(ct.labels[int(child.labelOffset) : int(child.labelOffset)+int(child.labelLen)])
-			rootChildren[label] = i
+	var rebuild func(oldIdx, newIdx int)
+	rebuild = func(oldIdx, newIdx int) {
+		children := ct.childIndices(oldIdx)
+		if len(children) == 0 {
+			return
+		}
+
+		start := len(newNodes)
+		newNodes[newIdx].childrenOffset = int32(start)
+		newNodes[newIdx].childrenCount = int32(len(children))
+
+		newChildIdxs := make([]int, len(children))
+		for i, childOldIdx := range children {
+			oldChild := ct.nodes[childOldIdx]
+			newChild := trieNodeCompact{
+				labelOffset: oldChild.labelOffset,
+				labelLen:    oldChild.labelLen,
+				valueIdx:    oldChild.valueIdx,
+				flags:       oldChild.flags,
+			}
+			newChildIdxs[i] = len(newNodes)
+			newNodes = append(newNodes, newChild)
+		}
+
+		for i, childOldIdx := range children {
+			rebuild(childOldIdx, newChildIdxs[i])
 		}
 	}
-	ct.childMaps = make([]map[string]int, 1)
-	ct.childMaps[0] = rootChildren
+
+	rebuild(ct.rootIdx, 0)
+	ct.nodes = newNodes
+	ct.childMaps = nil
+
+	// Shrink the flat slices to their exact size (releases over-capacity).
+	ct.labels = cloneBytesTight(ct.labels)
+	ct.values = cloneStringsTight(ct.values)
 
 	ct.labelOffsets = nil
 	ct.valueIndexes = nil

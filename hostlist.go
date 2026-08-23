@@ -203,9 +203,8 @@ func (h *Hostlist) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *dns.Ms
 	}
 
 	name := strings.ToLower(qname)
-	nameLabels := getLabels(name)
+	nameLabels := labelsFromFQDNLower(name)
 	blocked, allowed, exactBlockIP := h.evaluateRules(rules, name, nameLabels, safeSearchEntry != nil)
-	putLabels(nameLabels)
 
 	var shouldBlock bool
 	switch h.mode {
