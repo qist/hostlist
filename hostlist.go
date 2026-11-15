@@ -7,6 +7,7 @@ import (
 	"runtime"
 	"runtime/debug"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -28,6 +29,32 @@ type safeSearchResponseWriter struct {
 	entry   *SafeSearchEntry
 	qname   string
 	request *dns.Msg // Store the original request
+}
+
+// safeSearchWriterPool reuses the rewrite wrapper: it is created for every
+// safesearch query and carries no state beyond the current request.
+var safeSearchWriterPool = sync.Pool{
+	New: func() any { return &safeSearchResponseWriter{} },
+}
+
+func newSafeSearchWriter(w dns.ResponseWriter, entry *SafeSearchEntry, qname string, r *dns.Msg) *safeSearchResponseWriter {
+	rw := safeSearchWriterPool.Get().(*safeSearchResponseWriter)
+	rw.ResponseWriter = w
+	rw.entry = entry
+	rw.qname = qname
+	rw.request = r
+	return rw
+}
+
+func releaseSafeSearchWriter(rw *safeSearchResponseWriter) {
+	if rw == nil {
+		return
+	}
+	rw.ResponseWriter = nil
+	rw.entry = nil
+	rw.qname = ""
+	rw.request = nil
+	safeSearchWriterPool.Put(rw)
 }
 
 func (w *safeSearchResponseWriter) WriteMsg(m *dns.Msg) error {
@@ -122,6 +149,8 @@ type Hostlist struct {
 	parentalFallbackLoader *Loader
 
 	bypassIPs []net.IPNet // client IPs that bypass parental control and safe search
+	blockIP   net.IP      // pre-parsed block_type, nil for nxdomain/empty
+	soaCache  sync.Map    // zone -> *dns.SOA, avoids rebuilding SOA per blocked query
 	stopped   atomic.Bool
 }
 
@@ -134,6 +163,16 @@ type ruleSet struct {
 }
 
 func (h *Hostlist) Name() string { return pluginName }
+
+// soaFor returns the cached SOA record for zone, building it at most once.
+func (h *Hostlist) soaFor(zone string) *dns.SOA {
+	if v, ok := h.soaCache.Load(zone); ok {
+		return v.(*dns.SOA)
+	}
+	soa := soaFromZone(zone)
+	actual, _ := h.soaCache.LoadOrStore(zone, soa)
+	return actual.(*dns.SOA)
+}
 
 func soaFromZone(zone string) *dns.SOA {
 	ns := dns.Fqdn("ns1." + zone)
@@ -186,25 +225,13 @@ func (h *Hostlist) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *dns.Ms
 		len(rules.blockRegexps) == 0 && len(rules.allowRegexps) == 0 &&
 		rules.allowTrie.Len() == 0 {
 		if safeSearchEntry != nil {
-			rw := &safeSearchResponseWriter{
-				ResponseWriter: w,
-				entry:          safeSearchEntry,
-				qname:          qname,
-				request:        r,
-			}
-			if safeSearchEntry.CNAME != "" {
-				newReq := r.Copy()
-				newReq.Question[0].Name = safeSearchEntry.CNAME
-				return plugin.NextOrFailure(h.Name(), h.Next, ctx, rw, sanitizedRequestForUpstream(newReq))
-			}
-			return plugin.NextOrFailure(h.Name(), h.Next, ctx, rw, sanitizedRequestForUpstream(r))
+			return h.serveSafeSearch(ctx, w, r, safeSearchEntry, qname)
 		}
 		return plugin.NextOrFailure(h.Name(), h.Next, ctx, w, sanitizedRequestForUpstream(r))
 	}
 
 	name := strings.ToLower(qname)
-	nameLabels := labelsFromFQDNLower(name)
-	blocked, allowed, exactBlockIP := h.evaluateRules(rules, name, nameLabels, safeSearchEntry != nil)
+	blocked, allowed, exactBlockIP := h.evaluateRules(rules, name, safeSearchEntry != nil)
 
 	var shouldBlock bool
 	switch h.mode {
@@ -216,20 +243,7 @@ func (h *Hostlist) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *dns.Ms
 
 	if !shouldBlock {
 		if safeSearchEntry != nil && !allowed {
-			rw := &safeSearchResponseWriter{
-				ResponseWriter: w,
-				entry:          safeSearchEntry,
-				qname:          qname,
-				request:        r,
-			}
-			// Modify the request to query the CNAME target instead of the original domain
-			// This ensures downstream returns the correct IP for the safe search target
-			if safeSearchEntry.CNAME != "" {
-				newReq := r.Copy()
-				newReq.Question[0].Name = safeSearchEntry.CNAME
-				return plugin.NextOrFailure(h.Name(), h.Next, ctx, rw, sanitizedRequestForUpstream(newReq))
-			}
-			return plugin.NextOrFailure(h.Name(), h.Next, ctx, rw, sanitizedRequestForUpstream(r))
+			return h.serveSafeSearch(ctx, w, r, safeSearchEntry, qname)
 		}
 		return plugin.NextOrFailure(h.Name(), h.Next, ctx, w, sanitizedRequestForUpstream(r))
 	}
@@ -244,17 +258,16 @@ func (h *Hostlist) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *dns.Ms
 	switch h.blockType {
 	case "nxdomain":
 		m.Rcode = dns.RcodeNameError
-		m.Ns = []dns.RR{soaFromZone(zone)}
+		m.Ns = []dns.RR{h.soaFor(zone)}
 	case "empty":
 		m.Rcode = dns.RcodeSuccess
 	default: // "0.0.0.0" or any value
 		m.Rcode = dns.RcodeSuccess
-		blockIP := h.blockType
+		ipAddr := h.blockIP
 		if exactBlockIP != "" {
-			blockIP = exactBlockIP
+			// Per-domain hosts-file IP; parsed only when configured.
+			ipAddr = net.ParseIP(exactBlockIP)
 		}
-		// Parse the IP address
-		ipAddr := net.ParseIP(blockIP)
 		if ipAddr == nil {
 			// Fallback to 0.0.0.0 if parsing fails
 			ipAddr = net.IPv4zero
@@ -265,25 +278,42 @@ func (h *Hostlist) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *dns.Ms
 		}}
 	}
 
-	w.WriteMsg(m)
+	if err := w.WriteMsg(m); err != nil {
+		return m.Rcode, err
+	}
 	return m.Rcode, nil
 }
 
-func (h *Hostlist) evaluateRules(rules *ruleSet, name string, nameLabels []string, needAllowedForSafeSearch bool) (bool, bool, string) {
+// serveSafeSearch forwards the query with the safesearch response rewrite in
+// place, using a pooled wrapper around the real ResponseWriter.
+func (h *Hostlist) serveSafeSearch(ctx context.Context, w dns.ResponseWriter, r *dns.Msg, entry *SafeSearchEntry, qname string) (int, error) {
+	rw := newSafeSearchWriter(w, entry, qname, r)
+	defer releaseSafeSearchWriter(rw)
+
+	req := r
+	if entry.CNAME != "" {
+		// Query the CNAME target so downstream returns its address.
+		req = r.Copy()
+		req.Question[0].Name = entry.CNAME
+	}
+	return plugin.NextOrFailure(h.Name(), h.Next, ctx, rw, sanitizedRequestForUpstream(req))
+}
+
+func (h *Hostlist) evaluateRules(rules *ruleSet, name string, needAllowedForSafeSearch bool) (bool, bool, string) {
 	if h.mode == "whitelist" {
 		domainBlocked := false
 		if rules.domainTrie.Len() > 0 {
-			domainBlocked = rules.domainTrie.LookupWithParentCheckLabels(nameLabels)
+			domainBlocked = rules.domainTrie.LookupNameWithParentCheck(name)
 		}
 
 		exactBlocked, exactBlockIP := false, ""
 		if rules.exactTrie.Len() > 0 {
-			exactBlocked, exactBlockIP = rules.exactTrie.LookupExactValueLabels(nameLabels)
+			exactBlocked, exactBlockIP = rules.exactTrie.LookupExactValueName(name)
 		}
 
 		allowed := false
 		if rules.allowTrie.Len() > 0 {
-			allowed = rules.allowTrie.LookupWithParentCheckLabels(nameLabels)
+			allowed = rules.allowTrie.LookupNameWithParentCheck(name)
 		}
 		if !allowed && len(rules.allowRegexps) > 0 && MatchAny(name, rules.allowRegexps) {
 			allowed = true
@@ -298,12 +328,12 @@ func (h *Hostlist) evaluateRules(rules *ruleSet, name string, nameLabels []strin
 
 	domainBlocked := false
 	if rules.domainTrie.Len() > 0 {
-		domainBlocked = rules.domainTrie.LookupWithParentCheckLabels(nameLabels)
+		domainBlocked = rules.domainTrie.LookupNameWithParentCheck(name)
 	}
 
 	exactBlocked, exactBlockIP := false, ""
 	if rules.exactTrie.Len() > 0 {
-		exactBlocked, exactBlockIP = rules.exactTrie.LookupExactValueLabels(nameLabels)
+		exactBlocked, exactBlockIP = rules.exactTrie.LookupExactValueName(name)
 	}
 
 	blocked := domainBlocked || exactBlocked
@@ -321,7 +351,7 @@ func (h *Hostlist) evaluateRules(rules *ruleSet, name string, nameLabels []strin
 
 	allowed := false
 	if rules.allowTrie.Len() > 0 {
-		allowed = rules.allowTrie.LookupWithParentCheckLabels(nameLabels)
+		allowed = rules.allowTrie.LookupNameWithParentCheck(name)
 	}
 	if !allowed && len(rules.allowRegexps) > 0 {
 		allowed = MatchAny(name, rules.allowRegexps)
@@ -412,8 +442,6 @@ func (h *Hostlist) Update(result ParseResult) {
 	allowCount := newAllow.Len()
 	blockRegexCount := len(newBlockRe)
 	allowRegexCount := len(newAllowRe)
-
-	result = ParseResult{}
 
 	DomainsLoaded.Set(float64(total))
 	log.Infof("Updated hostlist: %d blocked domains, %d exact, %d allowlist, %d block regexps, %d allow regexps",

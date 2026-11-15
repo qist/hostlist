@@ -1,6 +1,110 @@
 package hostlist
 
-import "testing"
+import (
+	"fmt"
+	"testing"
+)
+
+// TestCompactTrieNameLookupMatchesLabelLookup guards the allocation-free name
+// walkers against the slice-based reference implementation. A divergence here
+// means wrong block decisions, so every variant is compared on the same trie.
+func TestCompactTrieNameLookupMatchesLabelLookup(t *testing.T) {
+	trie := NewCompactTrie()
+	blocked := []string{
+		"example.com.",
+		"ads.example.com.",
+		"tracker.sub.example.com.",
+		"xn--fiq228c.cn.",
+		"cn.",
+	}
+	for _, d := range blocked {
+		trie.Insert(d)
+	}
+	for _, d := range []string{"hosts.example.org.", "1.0.0.127.in-addr.arpa."} {
+		trie.InsertExactValue(d, "127.0.0.1")
+	}
+	trie.ClearChildrenMaps()
+
+	queries := append([]string{
+		"example.com.",
+		"EXAMPLE.COM.",
+		"example.com",
+		"www.example.com.",
+		"deep.www.example.com.",
+		"ads.example.com.",
+		"notads.example.com.",
+		"tracker.sub.example.com.",
+		"x.tracker.sub.example.com.",
+		"xn--fiq228c.cn.",
+		"cn.",
+		"other.net.",
+		".",
+		"",
+		"hosts.example.org.",
+		"1.0.0.127.in-addr.arpa.",
+	}, blocked...)
+
+	for _, name := range queries {
+		// Reference implementation: labels() normalizes case and FQDN, which
+		// is what the query path feeds the trie.
+		wantParent := trie.LookupWithParentCheck(name)
+		if got := trie.LookupNameWithParentCheck(name); got != wantParent {
+			t.Fatalf("LookupNameWithParentCheck(%q)=%v, want %v", name, got, wantParent)
+		}
+
+		wantMatch, wantVal := trie.LookupExactValue(name)
+		gotMatch, gotVal := trie.LookupExactValueName(name)
+		if gotMatch != wantMatch || gotVal != wantVal {
+			t.Fatalf("LookupExactValueName(%q)=(%v,%q), want (%v,%q)", name, gotMatch, gotVal, wantMatch, wantVal)
+		}
+	}
+}
+
+func buildBenchTrie(n int) *CompactTrie {
+	trie := NewCompactTrie()
+	for i := 0; i < n; i++ {
+		trie.Insert(fmt.Sprintf("host%d.blocklist%d.example.com.", i, i%97))
+	}
+	trie.InsertExactValue("exact.example.com.", "10.0.0.1")
+	trie.ClearChildrenMaps()
+	return trie
+}
+
+func BenchmarkLookupWithParentCheckLabels(b *testing.B) {
+	trie := buildBenchTrie(10000)
+	name := "www.host42.blocklist42.example.com."
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		trie.LookupWithParentCheckLabels(labelsFromFQDNLower(name))
+	}
+}
+
+func BenchmarkLookupNameWithParentCheck(b *testing.B) {
+	trie := buildBenchTrie(10000)
+	name := "www.host42.blocklist42.example.com."
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		trie.LookupNameWithParentCheck(name)
+	}
+}
+
+func BenchmarkInsertPrepared(b *testing.B) {
+	domains := make([]string, 10000)
+	for i := range domains {
+		domains[i] = fmt.Sprintf("host%d.example%d.com.", i, i%97)
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for n := 0; n < b.N; n++ {
+		trie := NewCompactTrie()
+		for _, d := range domains {
+			trie.insertNoLock(d)
+		}
+	}
+}
+
 
 func TestCompactTrieClearChildrenMapsPreservesLookup(t *testing.T) {
 	trie := NewCompactTrie()

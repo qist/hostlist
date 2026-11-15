@@ -8,49 +8,10 @@ import (
 	"github.com/miekg/dns"
 )
 
-// labelsPool reuses []string slices produced by labelsFromFQDNLower during
-// DNS query processing to avoid per-query heap allocations.
-var labelsPool = sync.Pool{
-	New: func() any { s := make([]string, 0, 16); return &s },
-}
-
-// getLabels returns a []string from the pool, cleared and filled with the
-// reversed labels of name. Callers must call putLabels when done.
-func getLabels(name string) []string {
-	fqdn := strings.TrimSuffix(name, ".")
-	if fqdn == "" {
-		return nil
-	}
-	pp := labelsPool.Get().(*[]string)
-	parts := (*pp)[:0]
-	// Split by '.' and reverse in-place
-	start := len(fqdn)
-	for i := len(fqdn) - 1; i >= 0; i-- {
-		if fqdn[i] == '.' {
-			parts = append(parts, fqdn[i+1:start])
-			start = i
-		}
-	}
-	if start > 0 {
-		parts = append(parts, fqdn[:start])
-	}
-	*pp = parts
-	return parts
-}
-
-// putLabels returns a slice obtained from getLabels to the pool.
-func putLabels(parts []string) {
-	if parts == nil {
-		return
-	}
-	// Check that parts is backed by the pool's allocation (capacity > 0)
-	if cap(parts) == 0 {
-		return
-	}
-	parts = parts[:0]
-	labelsPool.Put(&parts)
-}
-
+// CompactTrie is an immutable-once-published radix trie over reversed domain
+// labels. Builders (Insert*) take the write lock; lookups are lock-free and
+// rely on the caller never mutating a published trie (Update builds a new one
+// and swaps it into the atomic snapshot).
 type CompactTrie struct {
 	nodes        []trieNodeCompact
 	childMaps    []map[string]int
@@ -101,7 +62,11 @@ func labels(domain string) []string {
 }
 
 func labelsFromFQDNLower(domain string) []string {
-	fqdn := strings.TrimSuffix(domain, ".")
+	return splitReversed(strings.TrimSuffix(domain, "."))
+}
+
+// splitReversed splits an FQDN into its labels, TLD first.
+func splitReversed(fqdn string) []string {
 	if fqdn == "" {
 		return nil
 	}
@@ -110,6 +75,76 @@ func labelsFromFQDNLower(domain string) []string {
 		parts[i], parts[j] = parts[j], parts[i]
 	}
 	return parts
+}
+
+// trimName strips the trailing dot once; the label walkers below then match
+// labels in place, so a lookup allocates nothing.
+func trimName(name string) string {
+	return strings.TrimSuffix(name, ".")
+}
+
+// LookupNameWithParentCheck is LookupWithParentCheckLabels without the
+// per-query label slice; see that method for the matching rules.
+func (ct *CompactTrie) LookupNameWithParentCheck(name string) bool {
+	// ToLower is a no-op for the already lowercased query name, and keeps
+	// this entry point equivalent to the label-based API for other callers.
+	name = trimName(strings.ToLower(name))
+	if name == "" {
+		return false
+	}
+	nodeIdx := ct.rootIdx
+	depth := 0
+	for end := len(name); end > 0; {
+		start := strings.LastIndexByte(name[:end], '.') + 1
+		childIdx := ct.findChild(nodeIdx, name[start:end])
+		if childIdx == -1 {
+			if depth > 0 && ct.nodes[nodeIdx].blocked() {
+				return true
+			}
+			return false
+		}
+		nodeIdx = childIdx
+		node := ct.nodes[nodeIdx]
+		if node.blocked() || node.exact() {
+			return true
+		}
+		depth++
+		if start == 0 {
+			break
+		}
+		end = start - 1
+	}
+	return false
+}
+
+// LookupExactValueName is LookupExactValueLabels without the label slice.
+func (ct *CompactTrie) LookupExactValueName(name string) (bool, string) {
+	name = trimName(strings.ToLower(name))
+	if name == "" {
+		return false, ""
+	}
+	nodeIdx := ct.rootIdx
+	for end := len(name); end > 0; {
+		start := strings.LastIndexByte(name[:end], '.') + 1
+		childIdx := ct.findChild(nodeIdx, name[start:end])
+		if childIdx == -1 {
+			return false, ""
+		}
+		nodeIdx = childIdx
+		if start == 0 {
+			break
+		}
+		end = start - 1
+	}
+
+	node := ct.nodes[nodeIdx]
+	if !node.exact() {
+		return false, ""
+	}
+	if node.valueIdx == 0 || int(node.valueIdx) >= len(ct.values) {
+		return true, ""
+	}
+	return true, ct.values[node.valueIdx]
 }
 
 func NewCompactTrie() *CompactTrie {
@@ -235,14 +270,9 @@ func (ct *CompactTrie) addChild(parentIdx int, label string, blocked, exact bool
 		}
 	}
 
-	// 后续子节点：插入到当前子节点区域的末尾
-	currentOffset := int(ct.nodes[parentIdx].childrenOffset)
-	currentCount := int(ct.nodes[parentIdx].childrenCount)
-	newIdx := currentOffset + currentCount
-
-	// 优化：总是追加到末尾，不保证子节点连续存储
-	// ClearChildrenMaps 会在构建完成后做完整重建使子节点连续
-	newIdx = len(ct.nodes)
+	// Subsequent children are appended at the end of ct.nodes; ClearChildrenMaps
+	// rebuilds the layout so each parent's children end up contiguous.
+	newIdx := len(ct.nodes)
 	ct.nodes = append(ct.nodes, newNode)
 	ct.childMaps = append(ct.childMaps, nil)
 
@@ -266,24 +296,41 @@ func (ct *CompactTrie) Insert(domain string) {
 }
 
 func (ct *CompactTrie) insertNoLock(domain string) {
-	parts := labels(domain)
-	if len(parts) == 0 {
+	nodeIdx := ct.insertWalk(domain)
+	if nodeIdx < 0 {
 		return
-	}
-
-	nodeIdx := ct.rootIdx
-	for _, label := range parts {
-		childIdx := ct.findChild(nodeIdx, label)
-		if childIdx == -1 {
-			childIdx = ct.addChild(nodeIdx, label, false, false)
-		}
-		nodeIdx = childIdx
 	}
 
 	if !ct.nodes[nodeIdx].blocked() {
 		setBlocked(&ct.nodes[nodeIdx])
 		ct.count.Add(1)
 	}
+}
+
+// insertWalk walks (creating as needed) the nodes for domain and returns the
+// terminal node index, or -1 for an empty name. It scans the name in place,
+// so bulk inserts do not allocate a label slice per rule.
+func (ct *CompactTrie) insertWalk(domain string) int {
+	name := trimName(strings.ToLower(domain))
+	if name == "" {
+		return -1
+	}
+
+	nodeIdx := ct.rootIdx
+	for end := len(name); end > 0; {
+		start := strings.LastIndexByte(name[:end], '.') + 1
+		label := name[start:end]
+		childIdx := ct.findChild(nodeIdx, label)
+		if childIdx == -1 {
+			childIdx = ct.addChild(nodeIdx, label, false, false)
+		}
+		nodeIdx = childIdx
+		if start == 0 {
+			break
+		}
+		end = start - 1
+	}
+	return nodeIdx
 }
 
 func (ct *CompactTrie) InsertExact(domain string) {
@@ -303,18 +350,9 @@ func (ct *CompactTrie) insertExactNoLock(domain string) {
 }
 
 func (ct *CompactTrie) insertExactValueNoLock(domain, value string) {
-	parts := labels(domain)
-	if len(parts) == 0 {
+	nodeIdx := ct.insertWalk(domain)
+	if nodeIdx < 0 {
 		return
-	}
-
-	nodeIdx := ct.rootIdx
-	for _, label := range parts {
-		childIdx := ct.findChild(nodeIdx, label)
-		if childIdx == -1 {
-			childIdx = ct.addChild(nodeIdx, label, false, false)
-		}
-		nodeIdx = childIdx
 	}
 
 	if !ct.nodes[nodeIdx].exact() {
@@ -331,9 +369,6 @@ func (ct *CompactTrie) Lookup(domain string) bool {
 }
 
 func (ct *CompactTrie) LookupLabels(parts []string) bool {
-	ct.mu.RLock()
-	defer ct.mu.RUnlock()
-
 	if len(parts) == 0 {
 		return false
 	}
@@ -360,9 +395,6 @@ func (ct *CompactTrie) LookupExactValue(domain string) (bool, string) {
 }
 
 func (ct *CompactTrie) LookupExactValueLabels(parts []string) (bool, string) {
-	ct.mu.RLock()
-	defer ct.mu.RUnlock()
-
 	if len(parts) == 0 {
 		return false, ""
 	}
@@ -391,9 +423,6 @@ func (ct *CompactTrie) LookupWithParentCheck(domain string) bool {
 }
 
 func (ct *CompactTrie) LookupWithParentCheckLabels(parts []string) bool {
-	ct.mu.RLock()
-	defer ct.mu.RUnlock()
-
 	if len(parts) == 0 {
 		return false
 	}

@@ -34,8 +34,6 @@ type parseState struct {
 	seenParentalSources map[string]struct{}
 	parentalConfigured  bool
 	parentalExplicit    bool
-	inParentalBlock     bool
-	expectParentalBlock bool
 }
 
 func init() { plugin.Register(pluginName, setup) }
@@ -139,12 +137,19 @@ func parse(c *caddy.Controller) (*Hostlist, error) {
 		}
 
 		for c.NextBlock() {
-			if err := applyDirective(c, c.Val(), c.RemainingArgs(), config.Root, h, &state); err != nil {
+			name := c.Val()
+			blockArgs := c.RemainingArgs()
+			if name == "parental" && len(blockArgs) == 0 {
+				state.parentalConfigured = true
+				if err := parseParentalBlock(c, config.Root, &state); err != nil {
+					return nil, err
+				}
+				continue
+			}
+			if err := applyDirective(c, name, blockArgs, config.Root, h, &state); err != nil {
 				return nil, err
 			}
 		}
-		state.inParentalBlock = false
-		state.expectParentalBlock = false
 	}
 
 	if state.parentalConfigured && !state.parentalExplicit {
@@ -163,6 +168,12 @@ func parse(c *caddy.Controller) (*Hostlist, error) {
 		}
 	}
 
+	// Pre-parse the blocked answer address so the query path does not need to
+	// net.ParseIP on every blocked query.
+	if ip := net.ParseIP(h.blockType); ip != nil {
+		h.blockIP = ip.To4()
+	}
+
 	if len(state.sources) > 0 || len(state.allowSources) > 0 || len(state.userRules) > 0 {
 		h.loader = NewLoader(state.sources, state.allowSources, state.userRules, state.refreshInterval, state.cacheDir)
 	}
@@ -177,30 +188,11 @@ func parse(c *caddy.Controller) (*Hostlist, error) {
 }
 
 func applyDirective(c *caddy.Controller, name string, args []string, root string, h *Hostlist, state *parseState) error {
-	if name == "" || name == "}" {
-		state.inParentalBlock = false
-		state.expectParentalBlock = false
+	if name == "" {
 		return nil
 	}
-
-	targetParental := state.inParentalBlock
-
-	if name == "{" {
-		if !state.expectParentalBlock {
-			return c.Errf("unknown property %q", name)
-		}
-		state.inParentalBlock = true
-		state.expectParentalBlock = false
-		return nil
-	}
-	state.expectParentalBlock = false
 
 	appendSource := func(source FilterSource) {
-		if targetParental {
-			state.parentalConfigured = true
-			state.parentalSources = appendUniqueSource(state.parentalSources, state.seenParentalSources, source)
-			return
-		}
 		state.sources = appendUniqueSource(state.sources, state.seenSources, source)
 	}
 	switch name {
@@ -219,17 +211,11 @@ func applyDirective(c *caddy.Controller, name string, args []string, root string
 		}
 		appendSource(FilterSource{File: f})
 	case "whitelist_url":
-		if targetParental {
-			return c.Errf("unknown parental property %q", name)
-		}
 		if len(args) == 0 {
 			return c.ArgErr()
 		}
 		state.allowSources = appendUniqueSource(state.allowSources, state.seenAllowSources, FilterSource{URL: args[0]})
 	case "whitelist_file":
-		if targetParental {
-			return c.Errf("unknown parental property %q", name)
-		}
 		if len(args) == 0 {
 			return c.ArgErr()
 		}
@@ -239,9 +225,6 @@ func applyDirective(c *caddy.Controller, name string, args []string, root string
 		}
 		state.allowSources = appendUniqueSource(state.allowSources, state.seenAllowSources, FilterSource{File: f})
 	case "allowlist":
-		if targetParental {
-			return c.Errf("unknown parental property %q", name)
-		}
 		if len(args) == 0 {
 			return c.ArgErr()
 		}
@@ -249,9 +232,6 @@ func applyDirective(c *caddy.Controller, name string, args []string, root string
 			state.userRules = appendUniqueRule(state.userRules, state.seenUserRules, rule)
 		}
 	case "blocklist":
-		if targetParental {
-			return c.Errf("unknown parental property %q", name)
-		}
 		if len(args) == 0 {
 			return c.ArgErr()
 		}
@@ -259,9 +239,6 @@ func applyDirective(c *caddy.Controller, name string, args []string, root string
 			state.userRules = appendUniqueRule(state.userRules, state.seenUserRules, rule)
 		}
 	case "mode":
-		if targetParental {
-			return c.Errf("unknown parental property %q", name)
-		}
 		if len(args) == 0 {
 			return c.ArgErr()
 		}
@@ -272,9 +249,6 @@ func applyDirective(c *caddy.Controller, name string, args []string, root string
 			return c.Errf("invalid mode %q, must be 'blacklist' or 'whitelist'", args[0])
 		}
 	case "refresh":
-		if targetParental {
-			return c.Errf("unknown parental property %q", name)
-		}
 		if len(args) == 0 {
 			return c.ArgErr()
 		}
@@ -287,9 +261,6 @@ func applyDirective(c *caddy.Controller, name string, args []string, root string
 		}
 		state.refreshInterval = dur
 	case "block_type":
-		if targetParental {
-			return c.Errf("unknown parental property %q", name)
-		}
 		if len(args) == 0 {
 			return c.ArgErr()
 		}
@@ -300,9 +271,6 @@ func applyDirective(c *caddy.Controller, name string, args []string, root string
 			return c.Errf("invalid block_type %q, must be '0.0.0.0', 'nxdomain' or 'empty'", args[0])
 		}
 	case "cache_dir":
-		if targetParental {
-			return c.Errf("unknown parental property %q", name)
-		}
 		if len(args) == 0 {
 			return c.ArgErr()
 		}
@@ -312,9 +280,6 @@ func applyDirective(c *caddy.Controller, name string, args []string, root string
 		}
 		state.cacheDir = d
 	case "safesearch":
-		if targetParental {
-			return c.Errf("unknown parental property %q", name)
-		}
 		if len(args) == 0 {
 			return c.ArgErr()
 		}
@@ -327,30 +292,21 @@ func applyDirective(c *caddy.Controller, name string, args []string, root string
 			return c.Errf("invalid safesearch value %q, must be 'on' or 'off'", args[0])
 		}
 	case "parental":
-		if targetParental {
-			return c.Errf("unknown parental property %q", name)
-		}
-		if len(args) > 1 {
+		// A bare "parental" opens a nested block, which parse() handles
+		// before calling applyDirective.
+		if len(args) != 1 {
 			return c.ArgErr()
 		}
-		if len(args) == 1 {
-			state.parentalExplicit = true
-			switch args[0] {
-			case "on", "true":
-				h.parentalEnabled = true
-			case "off", "false":
-				h.parentalEnabled = false
-			default:
-				return c.Errf("invalid parental value %q, must be 'on' or 'off'", args[0])
-			}
-			return nil
+		state.parentalExplicit = true
+		switch args[0] {
+		case "on", "true":
+			h.parentalEnabled = true
+		case "off", "false":
+			h.parentalEnabled = false
+		default:
+			return c.Errf("invalid parental value %q, must be 'on' or 'off'", args[0])
 		}
-		state.parentalConfigured = true
-		state.expectParentalBlock = true
 	case "bypass_ip":
-		if targetParental {
-			return c.Errf("unknown parental property %q", name)
-		}
 		if len(args) == 0 {
 			return c.ArgErr()
 		}
@@ -370,10 +326,36 @@ func applyDirective(c *caddy.Controller, name string, args []string, root string
 			h.bypassIPs = append(h.bypassIPs, *cidr)
 		}
 	default:
-		if targetParental {
+		return c.Errf("unknown property %q", name)
+	}
+	return nil
+}
+
+// parseParentalBlock parses the nested "parental { ... }" block. Caddy's
+// NextBlock consumes the braces itself, so the block is parsed with a nested
+// loop instead of looking for "{" tokens.
+func parseParentalBlock(c *caddy.Controller, root string, state *parseState) error {
+	for c.NextBlock() {
+		name := c.Val()
+		args := c.RemainingArgs()
+		switch name {
+		case "url":
+			if len(args) == 0 {
+				return c.ArgErr()
+			}
+			state.parentalSources = appendUniqueSource(state.parentalSources, state.seenParentalSources, FilterSource{URL: args[0]})
+		case "file":
+			if len(args) == 0 {
+				return c.ArgErr()
+			}
+			f := args[0]
+			if !filepath.IsAbs(f) && root != "" {
+				f = filepath.Join(root, f)
+			}
+			state.parentalSources = appendUniqueSource(state.parentalSources, state.seenParentalSources, FilterSource{File: f})
+		default:
 			return c.Errf("unknown parental property %q", name)
 		}
-		return c.Errf("unknown property %q", name)
 	}
 	return nil
 }
